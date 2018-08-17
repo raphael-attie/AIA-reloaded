@@ -11,7 +11,7 @@ See youtube video at https://youtu.be/hC3gCB7ergY
 
 Download and unpack files into an empty parent directory.
 
-Main dependencies:
+Main python dependencies:
 
 * Python 3 (tested on 3.5 and above)
 * astropy
@@ -21,6 +21,8 @@ Main dependencies:
 * functools (if using multiprocessing)
 * [optional] pytest if you wish to run the unit tests. 
 
+External dependencies:
+* To fully automate the video creation from the rgb image series, you will need to install **ffmpeg**(https://www.ffmpeg.org)
  
 If you wish to run the test functions with **pytest**: 
 
@@ -31,7 +33,7 @@ If you wish to run the test functions with **pytest**:
   * [AIA 193](https://drive.google.com/open?id=1NCVU91LQoFfmZMdg9eFec6nzdDf6q7Qx)
   * [AIA 304](https://drive.google.com/open?id=1lCoKH_BghuCuFwsrTVbtBz76ynVG_NQP)
   
-* To fully automate the video creation from the rgb image series, you will need to install **ffmpeg**(https://www.ffmpeg.org)
+* From the terminal, go into the project directory and run **pytest test/test_aia.py -v**
 
 ### How does it work? 
 
