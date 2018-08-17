@@ -1,35 +1,50 @@
-import os
-import glob
-import numpy as np
-import calibration as calibration
-import visualization as visualization
-from multiprocessing import Pool
-import functools
+import visualization
 
-data_dir = '/Users/rattie/Data/SDO/AIA/event_2012_08_31/'
-outputdir = os.path.join(data_dir, 'rgb')
-wavelengths = ['304',
-               '171',
-               '193']
-data_dirs = [os.path.join(data_dir, wl) for wl in wavelengths]
+# Directory of the rgb images
+images_dir = '/Users/rattie/Data/SDO/AIA/event_2012_08_31/rgb'
+
+# Use uncropped images at 1/2 resolution (4096 x 4096 -> 2048 x 2048) - this only makes sense on 4k or 5k screens
+video_size = (2048, 2048)
+filename = 'rgb_movie_full_half'
+# Number of frames per second
+fps = 30
+# Encode movie
+visualization.encode_video(images_dir, filename, fps=fps, video_size=video_size)
 
 
-data_files = [glob.glob(os.path.join(data_dir, '*.fits')) for data_dir in data_dirs]
+# Use uncropped images at 1/4 resolution (4096 x 4096 -> 1024 x 1024)
+video_size = (1024, 1024)
+filename = 'rgb_movie_full_fourth_preset_veryslow_crf_10'
+# Number of frames per second
+fps = 30
+# Encode movie
+visualization.encode_video(images_dir, filename, fps=fps, video_size=video_size)
 
-# Get the high percentiles for rescaling the intensity for all images
-pdatargb0 = [calibration.aiaprep(data_files[j][0], cropsize=4096) for j in range(3)]
-# Get max percentile values for each channel.
-percentiles = [99.5, 99.99, 99.85]
-rgbhigh = np.array([visualization.compute_intensity_high(pdatargb0[i], percentiles[i]) for i in range(3)])
-partial_process = functools.partial(visualization.process_rgb_image, data_files=data_files, rgbhigh=rgbhigh, outputdir=outputdir)
 
-# For parallel processing
-p = Pool(4)
-p.map(visualization.process_rgb_image, range(len(data_files[0])))
+# Cropping over a 2048 x 2048 window in the bottom-left quadrant, at full resolution.
+crop = [2048, 2048, 0, 2048] # [width, height, x, y] where x, y are top-left corner of the cropping window
+video_size = (2048, 2048)
+filename = 'rgb_movie_crop_2048x2048_2048x2048'
+fps = 30
+# Encode movie
+visualization.encode_video(images_dir, filename, crop=crop, video_size=video_size)
 
-# For non-parallel processing
-# for i in range(len(data_files[0])):
-#     process_rgb_image(i)
 
-## For creating the movie, use ffmpeg. E.g from terminal:
-# ffmpeg -framerate 30 -i 'im_rgb_gamma_2.6_2.8_2.4_%3d.jpeg' -c:v libx264 -preset slow -crf 10 -r 30 -vf "scale=2048:2048" -pix_fmt yuv420p rgb_movie_2048.mp4
+# Same as before at half resolution
+crop = [2048, 2048, 0, 2048] # [width, height, x, y] where x, y are top-left corner of the cropping window
+video_size = (1024, 1024)
+filename = 'rgb_movie_2048x2048_1024x1024'
+fps = 30
+# Encode movie
+visualization.encode_video(images_dir, filename, crop=crop, video_size=video_size)
+
+
+# With a 16:9 aspect ratio, crop over 3840 x 2160 around bottom half and output at full HD resolution (1920 x 1080)
+crop = [3840, 2160, 128, 1935]
+video_size = (1920, 720)
+filename = 'rgb_movie_3840x2160_1920x1080_preset_veryslow_crf_10'
+fps = 30
+# Encode movie
+visualization.encode_video(images_dir, filename, crop=crop, video_size=video_size)
+
+
