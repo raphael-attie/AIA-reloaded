@@ -7,6 +7,7 @@ import visualization
 import functools
 from multiprocessing import Pool
 
+cv2.setNumThreads(2)
 
 def compute_intensity_high(image, cutoff_high):
     """
@@ -118,25 +119,6 @@ def process_rgb_image(i, data_files, rgbhigh, gamma_rgb=[2.8, 2.8, 2.4], btf=0.3
         return bgr_stack, outputfile
 
     return bgr_stack
-
-
-
-def write_rgb_images(data_dir, wavelengths, rgbhigh, outputdir, parallel=False):
-
-    wvlt_dirs = [os.path.join(data_dir, wl) for wl in wavelengths]
-    data_files = [glob.glob(os.path.join(data_dir, '*.fits')) for data_dir in wvlt_dirs]
-
-    partial_process = functools.partial(visualization.process_rgb_image, data_files=data_files, rgbhigh=rgbhigh,
-                                        outputdir=outputdir)
-
-    if parallel:
-        p = Pool(4)
-        _ = p.map(partial_process, range(len(data_files[0])))
-    else:
-        for i in range(len(data_files[0])):
-            _ = process_rgb_image(i)
-
-    return
 
 
 def encode_video(images_dir, movie_filename, image_format='jpeg', fps=30, file_ext='.mp4', crop=None, video_size=None, image_pattern_search=None):
