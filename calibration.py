@@ -71,7 +71,6 @@ def aiaprep(fitsfile, cropsize=None):
     angle = -header['CROTA2']
     # Run scaled rotation. The output will be a rotated, rescaled, padded array.
     prepdata = scale_rotate(data, angle=angle, scale_factor=scale_factor, reference_pixel=reference_pixel)
-    prepdata[prepdata<0] = 0
 
     if cropsize is not None:
         center = ((np.array(prepdata.shape) - 1) / 2.0).astype(int)

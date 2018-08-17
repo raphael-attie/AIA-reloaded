@@ -70,6 +70,28 @@ def get_rgb_high(data_files, percentiles=[99.5, 99.99, 99.85]):
     return rgbhigh
 
 
+def scale_rgb(prepped_rgb, rgbhigh, gamma_rgb=[2.8, 2.8, 2.4], btf=0.3):
+
+    # Get the rgb stack and normalize to 255.
+    im_rgb = np.stack(prepped_rgb, axis=-1) / rgbhigh  # ~700 ms
+    im_rgb.clip(0, 1, out=im_rgb) # ~50 ms
+
+    rgb_gamma = 1 / np.array(gamma_rgb)
+    im_rgb255 = (im_rgb ** rgb_gamma) * 255 # ~1.4 s
+
+    im_rgb255[:, :, 0] = im_rgb255[:, :, 0] + 0.7 * im_rgb255[:, :, 1] - btf * im_rgb255[:, :, 2]
+    im_rgb255[:, :, 1] = im_rgb255[:, :, 1] + 0.15 * im_rgb255[:, :, 0]
+    im_rgb255[:, :, 2] = im_rgb255[:, :, 2] + 0.1 * im_rgb255[:, :, 1]
+
+    newmin = np.array([35, 35, 35])
+    im_rgb255 = (im_rgb255 - newmin) * 255 / (255 - newmin)
+    im_rgb255.clip(0, 255, out=im_rgb255)
+
+    im_rgb255 = np.flipud(im_rgb255.astype(np.uint8))
+
+    return im_rgb255
+
+
 def process_rgb_image(i, data_files, rgbhigh, gamma_rgb=[2.8, 2.8, 2.4], btf=0.3, outputdir = None):
     """
     Create an rgb image out of three fits files at different wavelengths, conveniently scaled for visualization.
@@ -86,32 +108,14 @@ def process_rgb_image(i, data_files, rgbhigh, gamma_rgb=[2.8, 2.8, 2.4], btf=0.3
     # Prep aia data and export the r,g,b arrays into a list of numpy arrays.
     #pdatargb = [aiaprep(data_files[j][i]) for j in range(3)]
     pdatargb = [calibration.aiaprep(data_files[j][i], cropsize=4096) for j in range(3)]
-
-    # Get the rgb stack and normalize to 255.
-    im_rgb = np.stack(pdatargb, axis=-1) / rgbhigh
-    im_rgb.clip(0, 1, out=im_rgb)
-
-    g_r = gamma_rgb[0]
-    g_g = gamma_rgb[1]
-    g_b = gamma_rgb[2]
-    rgb_gamma = 1 / np.array([g_r, g_g, g_b])
-    im_rgb255 = (im_rgb ** rgb_gamma) * 255
-
-    im_rgb255[:, :, 0] = im_rgb255[:, :, 0] + 0.7 * im_rgb255[:, :, 1] - btf * im_rgb255[:, :, 2]
-    im_rgb255[:, :, 1] = im_rgb255[:, :, 1] + 0.15 * im_rgb255[:, :, 0]
-    im_rgb255[:, :, 2] = im_rgb255[:, :, 2] + 0.1 * im_rgb255[:, :, 1]
-
-    newmin = np.array([35, 35, 35])
-    im_rgb255 = (im_rgb255 - newmin) * 255 / (255 - newmin)
-    im_rgb255.clip(0, 255, out=im_rgb255)
-
-    im_rgb255 = np.flipud(im_rgb255.astype(np.uint8))
+    # Apply hdr tone-mapping
+    im_rgb255 = scale_rgb(pdatargb, rgbhigh, gamma_rgb=gamma_rgb, btf=btf)
     # OpenCV orders channels as B,G,R instead of R,G,B
     bgr_stack = np.stack([im_rgb255[:, :, 2], im_rgb255[:, :, 1], im_rgb255[:, :, 0]], axis=-1)
 
     if outputdir is not None:
         outputfile = os.path.join(outputdir,
-                                 'im_rgb_gamma_%0.1f_%0.1f_%0.1f_btf_%0.1f_%03d.jpeg' % (g_r, g_g, g_b, btf, i))
+                                 'im_rgb_gamma_%0.1f_%0.1f_%0.1f_btf_%0.1f_%03d.jpeg' % (*gamma_rgb, btf, i))
         cv2.imwrite(outputfile, bgr_stack, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
 
         return bgr_stack, outputfile
