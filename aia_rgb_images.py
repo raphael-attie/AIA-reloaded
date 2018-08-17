@@ -21,7 +21,7 @@ import functools
 import multiprocessing
 
 # Set parallelization. To disable, set ncores to 1 (or any smaller number)
-ncores = 4
+ncores = 1
 # Parent directory for the wavelength subdirectories
 data_dir = '/Users/rattie/Data/SDO/AIA/event_2012_08_31/'
 # Adapt to personal case.
@@ -40,7 +40,7 @@ if __name__ == '__main__':
                                         outputdir=outputdir)
     if ncores >1:
         multiprocessing.set_start_method('spawn')
-        p = multiprocessing.Pool(4)
+        p = multiprocessing.Pool(ncores)
         p.map(partial_process, range(len(data_files[0])))
         #p.map(partial_process, range(4))
         p.close()

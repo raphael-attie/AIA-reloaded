@@ -2,6 +2,7 @@ import numpy as np
 import cv2
 from astropy.io import fits
 
+
 def scale_rotate(image, angle=0, scale_factor=1, reference_pixel=None):
     """
     Perform scaled rotation with opencv. About 20 times faster than with Sunpy & scikit/skimage warp methods.
@@ -37,7 +38,8 @@ def scale_rotate(image, angle=0, scale_factor=1, reference_pixel=None):
     pad_y = int(np.ceil(np.max((diff[0], 0)) + diff2))
 
     padded_reference_pixel = reference_pixel + np.array([pad_x, pad_y])
-    padded_image = np.pad(image, ((pad_y, pad_y), (pad_x, pad_x)), mode='constant', constant_values=(0, 0))
+    #padded_image = np.pad(image, ((pad_y, pad_y), (pad_x, pad_x)), mode='constant', constant_values=(0, 0))
+    padded_image = aia_pad(image, pad_x, pad_y)
     padded_array_center = (np.array(padded_image.shape)[::-1] - 1) / 2.0
 
     # Get scaled rotation matrix accounting for padding
@@ -47,9 +49,8 @@ def scale_rotate(image, angle=0, scale_factor=1, reference_pixel=None):
     shift = padded_array_center - padded_reference_pixel
     rmatrix_cv[0, 2] += shift[0]
     rmatrix_cv[1, 2] += shift[1]
-    # Do the scaled rotation
+    # Do the scaled rotation with opencv. ~20x faster than Sunpy's map.rotate()
     rotated_image = cv2.warpAffine(padded_image, rmatrix_cv, padded_image.shape, cv2.INTER_CUBIC)
-    rotated_image[rotated_image<0] = 0
 
     return rotated_image
 
@@ -78,3 +79,15 @@ def aiaprep(fitsfile, cropsize=None):
         prepdata = prepdata[center[1] - half_size:center[1] + half_size, center[0] - half_size:center[0] + half_size]
 
     return prepdata
+
+
+# Alternate padding method. On AIA, it is ~6x faster than numpy.pad used in Sunpy's aiaprep
+def aia_pad(image, pad_x, pad_y):
+    newsize = [image.shape[0]+2*pad_y, image.shape[1]+2*pad_x]
+    pimage = np.empty(newsize)
+    pimage[0:pad_y,:] = 0
+    pimage[:,0:pad_x]=0
+    pimage[pad_y+image.shape[0]:, :] = 0
+    pimage[:, pad_x+image.shape[1]:] = 0
+    pimage[pad_y:image.shape[0]+pad_y, pad_x:image.shape[1]+pad_x] = image
+    return pimage

@@ -3,8 +3,8 @@ We are a group of solar physicist working with the Solar Dynamics Observatory (S
 
 This repository provides python scripts and functions to create calibrated and enhanced RGB image series and movies from the full resolution images of SDO/AIA at 3 different wavebands. 
 
-[![RGB image from SDO/AIA](images/im_rgb_gamma_2.8_2.8_2.4_btf_0.3_000_default.jpeg)](https://youtu.be/hC3gCB7ergY)
-See youtube video at https://youtu.be/hC3gCB7ergY
+[![RGB image from SDO/AIA](images/im_rgb_gamma_2.8_2.8_2.4_btf_0.3_000_default.jpeg)](https://youtu.be/GGl-2f2OG-Y)
+See youtube video at https://youtu.be/GGl-2f2OG-Y
 
 
 ## Installation
@@ -14,11 +14,10 @@ Download and unpack files into an empty parent directory.
 Main python dependencies:
 
 * Python 3 (tested on 3.5 and above)
+* numpy 
 * astropy
 * opencv (version 3.x.x)
-* numpy (will be installed, updated or downgraded when you install opencv)
 * multiprocessing (optional, for parallel processing)
-* functools (if using multiprocessing)
 * [optional] pytest if you wish to run the unit tests. 
 
 External dependencies:
