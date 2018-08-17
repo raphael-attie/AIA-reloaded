@@ -71,13 +71,15 @@ def get_rgb_high(data_files, percentiles=[99.5, 99.99, 99.85]):
     return rgbhigh
 
 
-def process_rgb_image(i, data_files, rgbhigh, outputdir = None):
+def process_rgb_image(i, data_files, rgbhigh, gamma_rgb=[2.8, 2.8, 2.4], btf=0.3, outputdir = None):
     """
     Create an rgb image out of three fits files at different wavelengths, conveniently scaled for visualization.
 
     :param i: image index in the list of file
     :param data_files: list of RGB files. The list is 2D: [rgb channels][image index]
     :param rgbhigh: maximum intensity value(s) for rescaling. scalar or 3-element numpy array.
+    :param gamma_rgb: gamma scaling factor for tone-mapping each channel from 3x12 bit hdr intensity to 3x8 bit
+    :param btf: a "blue tone factor" to tune the balance between a "hot" and a "cold" looking star (the greater btf, the colder)
     :param outputdir: path to output directory for printing the rgb jpeg image
     :return: rgb image as a 3-channel numpy array: [image rows, image cols, 3]
     """
@@ -90,14 +92,13 @@ def process_rgb_image(i, data_files, rgbhigh, outputdir = None):
     im_rgb = np.stack(pdatargb, axis=-1) / rgbhigh
     im_rgb.clip(0, 1, out=im_rgb)
 
-    g_r = 2.6
-    g_g = 2.8
-    g_b = 2.4
+    g_r = gamma_rgb[0]
+    g_g = gamma_rgb[1]
+    g_b = gamma_rgb[2]
     rgb_gamma = 1 / np.array([g_r, g_g, g_b])
     im_rgb255 = (im_rgb ** rgb_gamma) * 255
 
-    #im_rgb255[:,:,0] = im_rgb255[:,:,0] + 0.5 * im_rgb255[:,:,1]  #V1
-    im_rgb255[:, :, 0] = im_rgb255[:, :, 0] + 0.7 * im_rgb255[:, :, 1]- 0.4 * im_rgb255[:,:,2] #V2
+    im_rgb255[:, :, 0] = im_rgb255[:, :, 0] + 0.7 * im_rgb255[:, :, 1] - btf * im_rgb255[:, :, 2]
     im_rgb255[:, :, 1] = im_rgb255[:, :, 1] + 0.15 * im_rgb255[:, :, 0]
     im_rgb255[:, :, 2] = im_rgb255[:, :, 2] + 0.1 * im_rgb255[:, :, 1]
 
@@ -111,7 +112,7 @@ def process_rgb_image(i, data_files, rgbhigh, outputdir = None):
 
     if outputdir is not None:
         outputfile = os.path.join(outputdir,
-                                 'im_rgb_gamma_%0.1f_%0.1f_%0.1f_%03d.jpeg' % (g_r, g_g, g_b, i))
+                                 'im_rgb_gamma_%0.1f_%0.1f_%0.1f_btf_%0.1f_%03d.jpeg' % (g_r, g_g, g_b, btf, i))
         cv2.imwrite(outputfile, bgr_stack, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
 
         return bgr_stack, outputfile

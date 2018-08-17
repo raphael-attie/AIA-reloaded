@@ -49,14 +49,14 @@ def test_aiaprep_crop_4096():
 
 
 
-def setup_function(test_aia_rgb_image):
+def setup_function(test_aia_rgb_sample):
 
     for file in glob.glob('../aia_data/*.jpeg'):
         if os.path.exists(file):
             os.remove(file)
 
 
-def test_aia_rgb_image():
+def test_aia_rgb_sample():
     data_files = [[glob.glob('../aia_data/*304*.fits')[0]],
                   [glob.glob('../aia_data/*171*.fits')[0]],
                   [glob.glob('../aia_data/*193*.fits')[0]]]
@@ -64,7 +64,7 @@ def test_aia_rgb_image():
     pdatargb = [aiaprep(data_files[j][0], cropsize=4096) for j in range(3)]
     percentiles = [99.5, 99.99, 99.85]
     rgbhigh = np.array([compute_intensity_high(pdatargb[j], percentiles[j]) for j in range(3)])
-    _, outputfile = process_rgb_image(0, data_files, rgbhigh, outputdir='../aia_data/')
+    _, outputfile = process_rgb_image(0, data_files, rgbhigh, gamma_rgb=[2.8, 2.8, 2.4], btf=0.3, outputdir='../aia_data/')
     assert os.path.isfile(outputfile)
 
 
