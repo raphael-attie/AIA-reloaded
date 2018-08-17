@@ -27,9 +27,9 @@ If you wish to run the test functions with **pytest**:
 * create an **aia_data** directory in the parent directory
 
 * Download the 3 test raw AIA fits files and place them into the **aia_data** directory:
-  * https://drive.google.com/open?id=1-qT9RFb8NXFWlhbvNVVXm52JJ0cjLJyV
-  * https://drive.google.com/open?id=1NCVU91LQoFfmZMdg9eFec6nzdDf6q7Qx
-  * https://drive.google.com/open?id=1lCoKH_BghuCuFwsrTVbtBz76ynVG_NQP
+  * [AIA 171] https://drive.google.com/open?id=1-qT9RFb8NXFWlhbvNVVXm52JJ0cjLJyV
+  * [AIA 193] https://drive.google.com/open?id=1NCVU91LQoFfmZMdg9eFec6nzdDf6q7Qx
+  * [AIA 304] https://drive.google.com/open?id=1lCoKH_BghuCuFwsrTVbtBz76ynVG_NQP
   
 * To fully automate the video creation from the rgb image series, you will need to install **ffmpeg**(https://www.ffmpeg.org)
 
