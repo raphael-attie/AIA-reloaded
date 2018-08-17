@@ -23,7 +23,7 @@ import multiprocessing
 # Set parallelization. To disable, set ncores to 1 (or any smaller number)
 ncores = 1
 # Parent directory for the wavelength subdirectories
-data_dir = '/Users/rattie/Data/SDO/AIA/event_2012_08_31/'
+data_dir = os.path.expanduser('~/Data/SDO/AIA/event_2012_08_31/')
 # Adapt to personal case.
 wvlt_dirs = [os.path.join(data_dir, wl) for wl in ['304', '171', '193']]
 outputdir = os.path.join(data_dir, 'rgb')
