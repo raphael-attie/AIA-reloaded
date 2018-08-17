@@ -1,9 +1,10 @@
 # aia-reloaded
-We are a group of solar physicist working with the Solar Dynamics Observatory. Our goal is to deliver a new view of our nearest star through the combination of advanced image processing methods with more awareness on how we, as humans and scientists, associate color with information. 
+We are a group of solar physicist working with the Solar Dynamics Observatory (SDO), a NASA mission. This project is a singular attempt at delivering a new view of our nearest star through the combination of advanced image processing methods with more awareness on how we, as humans and scientists, associate color with information on the Sun. 
 
 This repository provides python scripts and functions to create calibrated and enhanced RGB image series and movies from the full resolution images of SDO/AIA at 3 different wavebands. 
 
-[![RGB image from SDO/AIA](images/im_rgb_gamma_2.6_2.8_2.4_000.jpeg)](https://youtu.be/kyVO2M6GtKE)
+[![RGB image from SDO/AIA](images/im_rgb_gamma_2.6_2.8_2.4_000.jpeg)](https://youtu.be/hC3gCB7ergY)
+See youtube video at https://youtu.be/hC3gCB7ergY
 
 
 ## Installation
@@ -34,4 +35,4 @@ If you wish to run the test functions with **pytest**:
 
 This framework assume you know how to download the raw fits files from SDO/AIA. 
 An example of the rgb image processing is given in aia_rgb_images.py. It processes the raw fits files by rescaling each channel which correspond to one waveband. Our examples use the wavebands centered at 304 (red channel), 171 (green channel) and 193 Anstrom (blue channel).
-The assignment of these wavebands to these colors is chosen in accordance to general human perception of colors. This is a singular attempt that aims at maximizing our ability to observe the dynamic of the plasma at different temperatures moving across the solar atmospheres. 
+The assignment of these wavebands to these colors is chosen in accordance to general human perception of colors. 

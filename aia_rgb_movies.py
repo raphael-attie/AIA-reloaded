@@ -1,3 +1,8 @@
+"""
+After generating the RGB images with e.g. aia_rgb_images.py,
+run any of the examples below to generate a movie with a given resolution and field of view.
+"""
+
 import visualization
 
 # Directory of the rgb images
@@ -5,7 +10,7 @@ images_dir = '/Users/rattie/Data/SDO/AIA/event_2012_08_31/rgb'
 
 # Use uncropped images at 1/2 resolution (4096 x 4096 -> 2048 x 2048) - this only makes sense on 4k or 5k screens
 video_size = (2048, 2048)
-filename = 'rgb_movie_full_half'
+filename = 'rgb_movie_full_half_preset_veryslow_crf_10'
 # Number of frames per second
 fps = 30
 # Encode movie
