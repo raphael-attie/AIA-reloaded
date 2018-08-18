@@ -17,7 +17,7 @@ percentiles = [99.5, 99.99, 99.85]
 # Intensity gamma scaling factors for tone-mapping the 3x12 bit high dynamic range into the 3x8 bit range
 gamma_rgb=[2.8, 2.8, 2.4]
 # Blue tone factor: tune the "hot" vs "cold" look of the sun. The greater the value, the colder the sun will look
-btf = 0.3
+btf = 0.2
 
 if __name__ == '__main__':
 

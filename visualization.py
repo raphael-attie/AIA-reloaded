@@ -72,24 +72,31 @@ def get_rgb_high(data_files, percentiles=[99.5, 99.99, 99.85]):
 
 def scale_rgb(prepped_rgb, rgbhigh, gamma_rgb=[2.8, 2.8, 2.4], btf=0.3):
 
-    # Get the rgb stack and normalize to 255.
-    im_rgb = np.stack(prepped_rgb, axis=-1) / rgbhigh  # ~700 ms
-    im_rgb.clip(0, 1, out=im_rgb) # ~50 ms
-
     rgb_gamma = 1 / np.array(gamma_rgb)
-    im_rgb255 = (im_rgb ** rgb_gamma) * 255 # ~1.4 s
+    # Get the rgb stack and normalize to 255.
 
-    im_rgb255[:, :, 0] = im_rgb255[:, :, 0] + 0.7 * im_rgb255[:, :, 1] - btf * im_rgb255[:, :, 2]
-    im_rgb255[:, :, 1] = im_rgb255[:, :, 1] + 0.15 * im_rgb255[:, :, 0]
-    im_rgb255[:, :, 2] = im_rgb255[:, :, 2] + 0.1 * im_rgb255[:, :, 1]
+    # im_rgb = np.stack(prepped_rgb, axis=-1) / rgbhigh  # ~700 ms
+    # im_rgb.clip(0, 1, out=im_rgb) # ~50 ms
+    # im_rgb255 = (im_rgb ** rgb_gamma) * 255  # ~1.4 s
+
+    for i in range(3):
+        np.divide(prepped_rgb[i], rgbhigh[i], out=prepped_rgb[i])
+        prepped_rgb[i].clip(0, 1, out=prepped_rgb[i])
+
+    red, green, blue = [(channel ** gamma) * 255 for (channel, gamma) in zip(prepped_rgb, rgb_gamma)]
+
+    nred = red + 0.6 * green - btf * blue  # ~ 320 ms
+    ngreen = green + 0.1*red + 0.1 * blue  # ~ 180 ms
+    nblue = blue + 0.1 * green  # ~ 180 ms
+
+    # Reverse channel order for opencv
+    rgb_stack = np.stack((nred, ngreen, nblue), axis=-1)
 
     newmin = np.array([35, 35, 35])
-    im_rgb255 = (im_rgb255 - newmin) * 255 / (255 - newmin)
-    im_rgb255.clip(0, 255, out=im_rgb255)
+    rgb_stack = (rgb_stack - newmin) * 255 / (255 - newmin)
+    rgb_stack.clip(0, 255, out=rgb_stack)
 
-    im_rgb255 = np.flipud(im_rgb255.astype(np.uint8))
-
-    return im_rgb255
+    return rgb_stack
 
 
 def process_rgb_image(i, data_files, rgbhigh, gamma_rgb=[2.8, 2.8, 2.4], btf=0.3, outputdir = None):
@@ -110,8 +117,8 @@ def process_rgb_image(i, data_files, rgbhigh, gamma_rgb=[2.8, 2.8, 2.4], btf=0.3
     pdatargb = [calibration.aiaprep(data_files[j][i], cropsize=4096) for j in range(3)]
     # Apply hdr tone-mapping
     im_rgb255 = scale_rgb(pdatargb, rgbhigh, gamma_rgb=gamma_rgb, btf=btf)
-    # OpenCV orders channels as B,G,R instead of R,G,B
-    bgr_stack = np.stack([im_rgb255[:, :, 2], im_rgb255[:, :, 1], im_rgb255[:, :, 0]], axis=-1)
+    # OpenCV orders channels as B,G,R instead of R,G,B, and flip upside down.
+    bgr_stack = np.flipud(np.flip(im_rgb255, axis=2))
 
     if outputdir is not None:
         outputfile = os.path.join(outputdir,
