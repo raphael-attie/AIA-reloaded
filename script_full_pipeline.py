@@ -1,17 +1,5 @@
 """
-Script automating the creation of AIA rgb images.
-This examples assumes that AIA raw fits files from the 3 different wavelengths are in three different directories under the
-same parent directory.
-
-The script creates first rgb images that are written to disk.
-The intensity in each channel is scaled to exploit the high dynamic range of the images using default tone-mapping values.
-Next, ffmpeg is called to create a movie from the jpeg files.
-
-Personal note: Opencv 3.4, when compiled with multithreading, imposes to change the multiprocessing start method
-with: multiprocessing.set_start_method('spawn'). Otherwise, the whole process exits silently.
-see https://github.com/opencv/opencv/issues/5150
-In addition, cv2.setNumThreads(0) will disable completely multithreading for opencv. Default is to use all available.
-
+Script automating the creation of AIA rgb images and movies
 """
 
 import os
@@ -35,15 +23,12 @@ gamma_rgb=[2.8, 2.8, 2.4]
 btf = 0.2
 
 
-
 if __name__ == '__main__':
 
     data_files = [glob.glob(os.path.join(data_dir, '*.fits')) for data_dir in wvlt_dirs]
     rgbhigh = visualization.get_rgb_high(data_files, percentiles=percentiles)
 
     partial_process = functools.partial(visualization.process_rgb_image, data_files=data_files, rgbhigh=rgbhigh,
-                                        btf=btf,
-                                        gamma_rgb=gamma_rgb,
                                         outputdir=outputdir)
     if ncores >1:
         multiprocessing.set_start_method('spawn')
@@ -56,3 +41,22 @@ if __name__ == '__main__':
             _ = partial_process(i)
 
 
+    # Directory of the rgb images
+    images_dir = outputdir
+
+    # With a 16:9 aspect ratio, crop over 3840 x 2160 around bottom half and output at full HD resolution (1920 x 1080)
+    crop = [3840, 2160, 128, 1935]
+    video_size = (1920, 720)
+    filename = 'rgb_movie_3840x2160_1920x1080'
+    fps = 30
+    # Encode movie
+    visualization.encode_video(images_dir, filename, crop=crop, video_size=video_size)
+
+    # full sun rescaled to 1080x1080 and padded at 1920 x 1080 for optimized youtube videos
+    frame_size = (1080, 1080)
+    padding = (1920, 1080)
+    filename = 'rgb_movie_full_padded_1920_1080'
+    # Number of frames per second
+    fps = 30
+    # Encode movie
+    visualization.encode_video(images_dir, filename, fps=fps, frame_size=frame_size, padding=padding)

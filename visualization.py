@@ -70,7 +70,7 @@ def get_rgb_high(data_files, percentiles=[99.5, 99.99, 99.85]):
     return rgbhigh
 
 
-def scale_rgb(prepped_rgb, rgbhigh, gamma_rgb=[2.8, 2.8, 2.4], btf=0.3):
+def scale_rgb(prepped_rgb, rgbhigh, gamma_rgb=[2.8, 2.8, 2.4], btf=0.2):
 
     rgb_gamma = 1 / np.array(gamma_rgb)
     # Get the rgb stack and normalize to 255.

@@ -18,15 +18,6 @@ if __name__ == '__main__':
     visualization.encode_video(images_dir, filename, fps=fps, video_size=video_size)
 
 
-    # Use uncropped images at 1/4 resolution (4096 x 4096 -> 1024 x 1024)
-    video_size = (1024, 1024)
-    filename = 'rgb_movie_full_fourth_preset'
-    # Number of frames per second
-    fps = 30
-    # Encode movie
-    visualization.encode_video(images_dir, filename, fps=fps, video_size=video_size)
-
-
     # Cropping over a 2048 x 2048 window in the bottom-left quadrant, at full resolution.
     crop = [2048, 2048, 0, 2048] # [width, height, x, y] where x, y are top-left corner of the cropping window
     video_size = (2048, 2048)
@@ -43,7 +34,6 @@ if __name__ == '__main__':
     fps = 30
     # Encode movie
     visualization.encode_video(images_dir, filename, crop=crop, video_size=video_size)
-
 
     # With a 16:9 aspect ratio, crop over 3840 x 2160 around bottom half and output at full HD resolution (1920 x 1080)
     crop = [3840, 2160, 128, 1935]
