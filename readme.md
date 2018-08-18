@@ -3,7 +3,7 @@ We are a group of solar physicist working with the Solar Dynamics Observatory (S
 
 This repository provides python scripts and functions to create calibrated and enhanced RGB image series and movies from the full resolution images of SDO/AIA at 3 different wavebands. 
 
-[![RGB image from SDO/AIA](images/im_rgb_gamma_2.8_2.8_2.4_btf_0.3_000_default.jpeg)](https://youtu.be/GGl-2f2OG-Y)
+[![RGB image from SDO/AIA](images/im_rgb_gamma_2.8_2.8_2.4_btf_0.3_169.jpeg)](https://youtu.be/GGl-2f2OG-Y)
 See youtube video at https://youtu.be/GGl-2f2OG-Y
 
 
