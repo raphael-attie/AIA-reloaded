@@ -45,9 +45,9 @@ if __name__ == '__main__':
 
     # full sun rescaled to 1080x1080 and padded at 1920 x 1080 for optimized youtube videos
     frame_size = (1080, 1080)
-    padding = (1920, 1080)
+    padded_size = (1920, 1080)
     filename = 'rgb_movie_full_padded_1920_1080'
     # Number of frames per second
     fps = 30
     # Encode movie
-    visualization.encode_video(images_dir, filename, fps=fps, frame_size=frame_size, padding=padding)
+    visualization.encode_video(images_dir, filename, fps=fps, frame_size=frame_size, padded_size=padded_size)
