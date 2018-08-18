@@ -123,7 +123,7 @@ def process_rgb_image(i, data_files, rgbhigh, gamma_rgb=[2.8, 2.8, 2.4], btf=0.3
     if outputdir is not None:
         outputfile = os.path.join(outputdir,
                                  'im_rgb_gamma_%0.1f_%0.1f_%0.1f_btf_%0.1f_%03d.jpeg' % (*gamma_rgb, btf, i))
-        cv2.imwrite(outputfile, bgr_stack, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+        cv2.imwrite(outputfile, bgr_stack, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
 
         return bgr_stack, outputfile
 
