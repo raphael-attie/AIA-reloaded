@@ -99,7 +99,7 @@ def scale_rgb(prepped_rgb, rgbhigh, gamma_rgb=[2.8, 2.8, 2.4], btf=0.2):
     return rgb_stack
 
 
-def process_rgb_image(i, data_files, rgbhigh, gamma_rgb=[2.8, 2.8, 2.4], btf=0.3, outputdir = None):
+def process_rgb_image(i, data_files, rgbhigh, gamma_rgb=[2.8, 2.8, 2.4], btf=0.3, outputdir = None, filename='image_rgb_'):
     """
     Create an rgb image out of three fits files at different wavelengths, conveniently scaled for visualization.
 
@@ -109,6 +109,7 @@ def process_rgb_image(i, data_files, rgbhigh, gamma_rgb=[2.8, 2.8, 2.4], btf=0.3
     :param gamma_rgb: gamma scaling factor for tone-mapping each channel from 3x12 bit hdr intensity to 3x8 bit
     :param btf: a "blue tone factor" to tune the balance between a "hot" and a "cold" looking star (the greater btf, the colder)
     :param outputdir: path to output directory for printing the rgb jpeg image
+    :param filename: common basename for the jpeg images. It will be appended with the image number
     :return: rgb image as a 3-channel numpy array: [image rows, image cols, 3]
     """
 
@@ -121,8 +122,7 @@ def process_rgb_image(i, data_files, rgbhigh, gamma_rgb=[2.8, 2.8, 2.4], btf=0.3
     bgr_stack = np.flipud(np.flip(im_rgb255, axis=2))
 
     if outputdir is not None:
-        outputfile = os.path.join(outputdir,
-                                 'im_rgb_gamma_%0.1f_%0.1f_%0.1f_btf_%0.1f_%03d.jpeg' % (*gamma_rgb, btf, i))
+        outputfile = os.path.join(outputdir, filename + '_%d.jpeg' % i)
         cv2.imwrite(outputfile, bgr_stack, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
 
         return bgr_stack, outputfile

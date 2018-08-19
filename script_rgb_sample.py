@@ -19,10 +19,16 @@ gamma_rgb=[2.8, 2.8, 2.4]
 # Blue tone factor: tune the "hot" vs "cold" look of the sun. The greater the value, the colder the sun will look
 btf = 0.2
 
+# output directory and filename for the jpeg images. These filename will be appended with the image number:
+outputdir = '../aia_data/'
+filename = 'im_p_%.2f_%.1f_%.1f_g_%0.1f_%0.1f_%0.1f_btf_%0.1f'%(*percentiles, *gamma_rgb, btf)
+
+
 if __name__ == '__main__':
 
     pdatargb = [aiaprep(data_files[j][0], cropsize=4096) for j in range(3)]
     rgbhigh = np.array([compute_intensity_high(pdatargb[j], percentiles[j]) for j in range(3)])
-    _, outputfile = process_rgb_image(0, data_files, rgbhigh, gamma_rgb=gamma_rgb, btf=btf, outputdir='../aia_data/')
+    _, outputfile = process_rgb_image(0, data_files, rgbhigh, gamma_rgb=gamma_rgb, btf=btf,
+                                      outputdir=outputdir, filename=filename)
 
 

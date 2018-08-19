@@ -26,15 +26,15 @@ ncores = 1
 data_dir = os.path.expanduser('~/Data/SDO/AIA/event_2012_08_31/')
 # Adapt to personal case.
 wvlt_dirs = [os.path.join(data_dir, wl) for wl in ['304', '171', '193']]
-outputdir = os.path.join(data_dir, 'rgb')
 # Default intensity percentiles for the rescaling of each channel
 percentiles = [99.5, 99.99, 99.85]
 # Intensity gamma scaling factors for tone-mapping the 3x12 bit high dynamic range into the 3x8 bit range
 gamma_rgb=[2.8, 2.8, 2.4]
 # Blue tone factor: tune the "hot" vs "cold" look of the sun. The greater the value, the colder the sun will look
 btf = 0.2
-
-
+# output directory and filename for the jpeg images. These filename will be appended with the image number:
+outputdir = os.path.join(data_dir, 'rgb')
+filename = 'im_rgb_gamma_%0.1f_%0.1f_%0.1f_btf_%0.1f'%(*gamma_rgb, btf)
 
 if __name__ == '__main__':
 
@@ -44,7 +44,8 @@ if __name__ == '__main__':
     partial_process = functools.partial(visualization.process_rgb_image, data_files=data_files, rgbhigh=rgbhigh,
                                         btf=btf,
                                         gamma_rgb=gamma_rgb,
-                                        outputdir=outputdir)
+                                        outputdir=outputdir,
+                                        filename = filename)
     if ncores >1:
         multiprocessing.set_start_method('spawn')
         p = multiprocessing.Pool(ncores)
