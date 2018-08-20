@@ -119,7 +119,7 @@ def process_rgb_image(i, data_files, rgbhigh, gamma_rgb=[2.8, 2.8, 2.4], btf=0.3
     # Apply hdr tone-mapping
     im_rgb255 = scale_rgb(pdatargb, rgbhigh, gamma_rgb=gamma_rgb, btf=btf)
     # OpenCV orders channels as B,G,R instead of R,G,B, and flip upside down.
-    bgr_stack = np.flipud(np.flip(im_rgb255, axis=2))
+    bgr_stack = np.flipud(np.flip(im_rgb255, axis=2)).astype(np.uint8)
 
     if outputdir is not None:
         outputfile = os.path.join(outputdir, filename + '_%d.jpeg' % i)
