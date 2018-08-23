@@ -3,134 +3,126 @@ import numpy as np
 import cv2
 import calibration
 import subprocess
-import visualization
-
-#cv2.setNumThreads(0)
-
-def compute_intensity_high(image, cutoff_high):
-    """
-    Compute the image percentile-based high intensity threshold up to which we stretch (rescale) the intensity.
-
-    :param image: input image
-    :param cutoff_high: percentile. Typical values within [99.97 - 99.99]
-    :return: maximum thresholding intensity
-    """
-    nbins = 256
-    im_hist, bin_edges = np.histogram(image, nbins)
-    hist_width = bin_edges[1] - bin_edges[0]
-    intensity_high = calc_threshold(cutoff_high, im_hist, hist_width)
-
-    return intensity_high
+from calibration import aiaprep
 
 
+def rgb_high_low(data_files, percentiles_low, percentiles_high):
 
-def calc_threshold(cutoff, im_hist, hist_width):
-    """
-    Calculate the intensity at the input cutoff-percentage of total pixels given an image histogram and bin width.
-    This can be used to calculate, for example, the min or max threshold for rescaling the image intensity
-
-    :param cutoff: cutoff percentage of total pixels in the histogram
-    :param im_hist: image histogram
-    :param hist_width: bin width of the image histogram
-    :return: intensity value
-    """
-    npixels = im_hist.sum()
-    nbins = im_hist.shape[0]
-
-    cdf = 0.0
-    i = 0
-    count = 0
-    while i < nbins:
-        cdf += im_hist[i]
-        if 100.0 * cdf / npixels > cutoff:
-            count = i
-            break
-        i += 1
-
-    if i == nbins:
-        count = nbins - 1
-
-    intensity = hist_width * count
-
-    return intensity
+    pdatargb = [aiaprep(data_files[j][0]) for j in range(3)]
+    rgblow = np.array([np.percentile(pdatargb[j], percentiles_low[j]) for j in range(3)])
+    rgbhigh = np.array([np.percentile(pdatargb[j], percentiles_high[j]) for j in range(3)])
+    return rgblow, rgbhigh
 
 
-def get_rgb_high(data_files, percentiles=[99.5, 99.99, 99.85]):
-    """
-    Calculate the maximum intensity values for each channel to use for rescaling.
-    :param data_files: images files listed in 3 image directories, 1 per wavelength.
-    :param percentiles: define the high intensity threshold for each wavelength
-    :return: high intensity values for each wavelength
-    """
-    # Get the high percentiles for rescaling the intensity for all images
-    pdatargb0 = [calibration.aiaprep(data_files[j][0], cropsize=4096) for j in range(3)]
-    # Get max percentile values for each channel.
-    rgbhigh = np.array([visualization.compute_intensity_high(pdatargb0[i], percentiles[i]) for i in range(3)])
+def scale_rgb(rgb, rgblow, rgbhigh, gamma_rgb=[2.8, 2.8, 2.4], scalemin=0, rgbmix=None):
 
-    return rgbhigh
-
-
-def scale_rgb(prepped_rgb, rgbhigh, gamma_rgb=[2.8, 2.8, 2.4], btf=0.2):
 
     rgb_gamma = 1 / np.array(gamma_rgb)
-    # Get the rgb stack and normalize to 255.
 
-    # im_rgb = np.stack(prepped_rgb, axis=-1) / rgbhigh  # ~700 ms
-    # im_rgb.clip(0, 1, out=im_rgb) # ~50 ms
-    # im_rgb255 = (im_rgb ** rgb_gamma) * 255  # ~1.4 s
-
+    # Copy is needed due to in-place operations
+    rgb2 = rgb.copy()
     for i in range(3):
-        np.divide(prepped_rgb[i], rgbhigh[i], out=prepped_rgb[i])
-        prepped_rgb[i].clip(0, 1, out=prepped_rgb[i])
+        rgb2[i] = (rgb[i] - rgblow[i]) * 1 / (rgbhigh[i] - rgblow[i])
+        rgb2[i].clip(0, 1, out=rgb2[i])
 
-    red, green, blue = [(channel ** gamma) * 255 for (channel, gamma) in zip(prepped_rgb, rgb_gamma)]
+    red, green, blue = [(channel ** gamma) for (channel, gamma) in zip(rgb2, rgb_gamma)]
 
-    nred = red + 0.6 * green - btf * blue  # ~ 320 ms
-    ngreen = green + 0.1*red + 0.1 * blue  # ~ 180 ms
-    nblue = blue + 0.1 * green  # ~ 180 ms
+    # nred = red + 0.4 * green - btf * blue  # ~ 320 ms
+    # ngreen = green + 0.1*red  # ~ 180 ms
+    # nblue = blue
+    if rgbmix is not None:
+        [[rr, rg, rb], [gr, gg, gb], [br, bg, bb]] = rgbmix
+        nred = rr*red + rg*green + rb*blue  # ~ 320 ms
+        ngreen = gr*red + gg*green + gb*blue  # ~ 180 ms
+        nblue = br*red + bg*green + bb*blue
+        rgb_stack = np.stack((nred, ngreen, nblue), axis=-1).astype(np.float32)
+    else:
+        rgb_stack = np.stack((red, green, blue), axis=-1).astype(np.float32)
 
-    # Reverse channel order for opencv
-    rgb_stack = np.stack((nred, ngreen, nblue), axis=-1)
-
-    newmin = np.array([35, 35, 35])
-    rgb_stack = (rgb_stack - newmin) * 255 / (255 - newmin)
+    # stack and rescale channels for 8-bit range, convert from 64 to 32 bit float for now (needed for CIELab)
+    rgb_stack.clip(0, 1, out=rgb_stack)
+    rgb_stack *= 255
+    # Contrast stretch in RGB space
+    rgb_stack = (rgb_stack- scalemin) * 255 / (255 - scalemin)
     rgb_stack.clip(0, 255, out=rgb_stack)
+
 
     return rgb_stack
 
 
-def process_rgb_image(i, data_files, rgbhigh, gamma_rgb=[2.8, 2.8, 2.4], btf=0.3, outputdir = None, filename='image_rgb_'):
+def process_lab_32bit(bgr, lf=1, af=1, bf=1, Lmin=0):
+
+    # 32 bits needs to be scaled withi [0-1]
+    bgr2 = (bgr - bgr.min()) * 1 / (bgr.max() - bgr.min())
+    lab = cv2.cvtColor(bgr2, cv2.COLOR_BGR2Lab)
+    L, a, b = [lab[:, :, i] for i in range(3)]
+    # In 32 bits, L ranges within [0 - 100]. In 8 bit: [0 255]
+    # Convert to 8 bit range
+    L *= 255/100
+    a += 128
+    b += 128
+
+    L = (L - Lmin) * lf * 255 / (255 - Lmin)
+    a *= af
+    b *= bf
+    lab = np.stack([L, a, b], axis=-1)
+    lab.clip(0, 255, out=lab)
+
+    return lab
+
+
+def process_rgb_image(i, data_files, rgblow, rgbhigh, gamma_rgb=(2.8, 2.8, 2.4), scalemin=0, rgbmix=None, lab=None, lmin=0, crop=None, outputdir = None, filename_rgb='image_rgb', filename_lab='image_lab'):
     """
     Create an rgb image out of three fits files at different wavelengths, conveniently scaled for visualization.
 
     :param i: image index in the list of file
     :param data_files: list of RGB files. The list is 2D: [rgb channels][image index]
+    :param rgblow: minimum intensity value(s) for rescaling. scalar or 3-element numpy array.
     :param rgbhigh: maximum intensity value(s) for rescaling. scalar or 3-element numpy array.
     :param gamma_rgb: gamma scaling factor for tone-mapping each channel from 3x12 bit hdr intensity to 3x8 bit
-    :param btf: a "blue tone factor" to tune the balance between a "hot" and a "cold" looking star (the greater btf, the colder)
-    :param outputdir: path to output directory for printing the rgb jpeg image
-    :param filename: common basename for the jpeg images. It will be appended with the image number
+    :param scalemin: minimum intensity for contrast stretching
+    :param rgbmix: 3x3 array of mixing parameters of the rgb channels.
+    :param outputdir: path to rgb jpeg image
+    :param lab: CIELab parameters
+    :param lmin: optionnaly used with lab. Minimum luminance for rescaling into the 8 bit range.
+    :param crop: tuple of slices of (y,x)=(rows, cols) coordinates for cropping. E.g (slice(0,1024), slice(100,3200))
+    :param filename_rgb: common basename for the jpeg images if lab space unused. Appended with the image number
+    :param filename_lab: used for lab-space-modified image. Appended with the image number.
     :return: rgb image as a 3-channel numpy array: [image rows, image cols, 3]
     """
 
+    bgr_stack2 = None
     # Prep aia data and export the r,g,b arrays into a list of numpy arrays.
     #pdatargb = [aiaprep(data_files[j][i]) for j in range(3)]
     pdatargb = [calibration.aiaprep(data_files[j][i], cropsize=4096) for j in range(3)]
     # Apply hdr tone-mapping
-    im_rgb255 = scale_rgb(pdatargb, rgbhigh, gamma_rgb=gamma_rgb, btf=btf)
+    im_rgb255 = scale_rgb(pdatargb, rgblow, rgbhigh, gamma_rgb=gamma_rgb, scalemin=scalemin, rgbmix=rgbmix)
+
     # OpenCV orders channels as B,G,R instead of R,G,B, and flip upside down.
-    bgr_stack = np.flipud(np.flip(im_rgb255, axis=2)).astype(np.uint8)
+    bgr_stack = np.flipud(np.flip(im_rgb255, axis=2))
 
-    if outputdir is not None:
-        outputfile = os.path.join(outputdir, filename + '_%d.jpeg' % i)
-        cv2.imwrite(outputfile, bgr_stack, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+    bgr_stack1 = np.clip(bgr_stack, 0, 255)
+    bgr_stack1 = bgr_stack1.astype(np.uint8)
+    if crop is not None:
+        bgr_stack1 = bgr_stack1[crop]
 
-        return bgr_stack, outputfile
+    if outputdir is not None and lab is None:
+        outputfile_rgb = os.path.join(outputdir, filename_rgb + '_%03d.jpeg' %i)
+        cv2.imwrite(outputfile_rgb, bgr_stack1, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
 
-    return bgr_stack
+    if lab is not None:
+        lab32 = process_lab_32bit(bgr_stack, lf=lab[0], af=lab[1], bf=lab[2], Lmin=lmin)
+        bgr_stack2 = cv2.cvtColor(lab32.astype(np.uint8), cv2.COLOR_Lab2BGR)
+        if crop is not None:
+            bgr_stack2 = bgr_stack2[crop]
+        if outputdir is not None:
+            outputfile_lab = os.path.join(outputdir, filename_lab + '_%03d.jpeg' % i)
+            cv2.imwrite(outputfile_lab, bgr_stack2, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+
+    return bgr_stack1, bgr_stack2
 
 
-def encode_video(images_dir, movie_filename, image_format='jpeg', fps=30, file_ext='.mp4', crop=None, frame_size=None, padded_size=None, image_pattern_search=None):
+def encode_video(images_dir, movie_filename, image_format='jpeg', fps=30, file_ext='.mp4', crop=None, frame_size=None, padded_size=None, image_pattern_search=None, command_only=False):
     """
     Create a movie from jpeg images. Input images will be found based on the image directory and a pattern search.
 
@@ -183,7 +175,7 @@ def encode_video(images_dir, movie_filename, image_format='jpeg', fps=30, file_e
     command = ["ffmpeg",
                "-framerate", "%d" % fps,
                "-pattern_type", "glob",
-               "-i", "%s"%image_pattern_search,
+               "-i", image_pattern_search,
                "-c:v", "libx264",
                "-preset", "slow",
                "-crf", "18",
@@ -192,6 +184,10 @@ def encode_video(images_dir, movie_filename, image_format='jpeg', fps=30, file_e
                "-pix_fmt", "yuv420p",
                filename,
                "-y"]
+    # Working example:
+    # ffmpeg -framerate 30 -pattern_type glob -i 'im_rgb_*.jpeg' -c:v libx264 -preset slow -crf 18 -r 30 -vf crop=3840:2160:128:1935,scale=1920:1080 -pix_fmt yuv420p rgb_movie_3840x2160_1920x1080.mp4 -y
+    if command_only:
+        return subprocess.list2cmdline(command)
 
     try:
         _ = subprocess.check_call(command, cwd=images_dir)
@@ -199,6 +195,6 @@ def encode_video(images_dir, movie_filename, image_format='jpeg', fps=30, file_e
     except subprocess.CalledProcessError:
         print('Movie creation failed')
 
-    return None
+    return subprocess.list2cmdline(command)
 
 

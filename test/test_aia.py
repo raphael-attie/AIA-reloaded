@@ -1,7 +1,7 @@
 import os, glob
 import numpy as np
 from calibration import scale_rotate, aiaprep
-from visualization import compute_intensity_high, process_rgb_image
+from visualization import process_rgb_image
 
 
 # Testing for any non-zero values at borders
@@ -63,7 +63,7 @@ def test_aia_rgb_sample():
 
     pdatargb = [aiaprep(data_files[j][0], cropsize=4096) for j in range(3)]
     percentiles = [99.5, 99.99, 99.85]
-    rgbhigh = np.array([compute_intensity_high(pdatargb[j], percentiles[j]) for j in range(3)])
+    rgbhigh = np.array([np.percentile(pdatargb[j], percentiles[j]) for j in range(3)])
     _, outputfile = process_rgb_image(0, data_files, rgbhigh, gamma_rgb=[2.8, 2.8, 2.4], btf=0.3, outputdir='../aia_data/')
     assert os.path.isfile(outputfile)
 
