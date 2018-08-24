@@ -4,7 +4,10 @@ import cv2
 import calibration
 import subprocess
 from calibration import aiaprep
+import multiprocessing
 
+#  disable multithreading in opencv. Default is to use all available, which is rather inefficient in this context
+cv2.setNumThreads(0)
 
 class RGBMixer:
     """
@@ -54,7 +57,6 @@ class RGBMixer:
                 raise ValueError('wavelength directories do not exist')
 
 
-
         self.ref_rgb_files = [files[ref] for files in self.data_files]
         self.crop = crop
         # Reference image index to extract scaling values
@@ -71,12 +73,11 @@ class RGBMixer:
         self.filename_lab = filename_lab
         self.filepath_lab = None
         # Intensity percentiles for linear scaling
-        self.percentiles_low = [0, 0, 0]
-        self.percentiles_high = [99.99, 99.99, 99.99]
+        self.percentiles_low = (0, 0, 0)
+        self.percentiles_high = (99.99, 99.99, 99.99)
 
         # Intensity gamma scaling factors for tone-mapping the 3x12 bit high dynamic range into the 3x8 bit range
-        self.gamma_rgb = [1, 1, 1]
-
+        self.gamma_rgb = (1, 1, 1)
         self.rgbmix = np.array([[1, 0, 0],
                                 [0, 1, 0],
                                 [0, 0, 1]])
@@ -84,23 +85,26 @@ class RGBMixer:
         self.lab = None
         # For contrast stretching on luminance (L) layer. L ranges in [0-255]
         self.lmin = 0
-
-        # Load and prep reference image
-        self.ref_rgb = [aiaprep(self.data_files[j][0]) for j in range(3)]
+        # Reference rgb image used for the intensity scaling values
+        self.ref_rgb = None
 
 
 
     def set_aia_default(self):
-        self.percentiles_low = [25, 25, 25]
-        self.percentiles_high = [99.5, 99.99, 99.85]
+
+        # Load and prep reference image
+        self.ref_rgb = [aiaprep(fitsfile) for fitsfile in self.ref_rgb_files]
+
+        self.percentiles_low = (25, 25, 25)
+        self.percentiles_high = (99.5, 99.99, 99.85)
 
         self.rgbmix= np.array([[1.0, 0.6, -0.3],
                                [0.0, 1.0, 0.1],
                                [0.0, 0.1, 1.0]])
 
-        self.gamma_rgb = [2.8, 2.8, 2.4]
+        self.gamma_rgb = (2.8, 2.8, 2.4)
         self.scalemin = 20
-        self.lab = [1, 0.96, 1.04]
+        self.lab = (1, 0.96, 1.04)
         self.lmin = 0
         self.filename_lab = 'im_lab'
         self.set_ref_low_high()
@@ -129,7 +133,6 @@ class RGBMixer:
         else:
             self.filepath_lab = None
 
-        self.set_ref_low_high()
         bgr_stack1, bgr_stack2 = process_rgb_image(image_index, data_files=self.data_files,
                                                    rgblow=self.rgblow, rgbhigh=self.rgbhigh, scalemin=self.scalemin,
                                                    gamma_rgb=self.gamma_rgb,
@@ -140,20 +143,28 @@ class RGBMixer:
         return bgr_stack1, bgr_stack2
 
 
+    def process_rgb_list(self, ncores, file_range):
+
+        if ncores > 1:
+            multiprocessing.set_start_method('spawn')
+            p = multiprocessing.Pool(ncores)
+            p.map(self.process_rgb, file_range)
+            p.close()
+        else:
+            for i in file_range:
+                _ = self.process_rgb(i)
 
 
 
-
-
-def rgb_high_low(data_files, percentiles_low, percentiles_high):
+def rgb_high_low(rgb_files, percentiles_low, percentiles_high):
     """ Convenience function to get the minimum and maximum rescaling values of each channel before gamma scaling.
 
-    :param data_files: list of 3 series of file. 1 list per channel => data_files[channel index][image index]
+    :param rgb_files: list of 3 files. 1 per channel
     :param percentiles_low: list of percentiles for the minimum scaling value, in order of [red, green, blue]
     :param percentiles_high: list of percentiles for the maximum scaling value, in order of [red, green, blue]
-    :return: 2 lists of minimum and maximum intensity. one per channel in each list.
+    :return: 2 lists of 3 minimum and maximum intensity. one per channel in each list.
     """
-    pdatargb = [aiaprep(data_files[j][0]) for j in range(3)]
+    pdatargb = [aiaprep(rgb_files[j]) for j in range(3)]
     rgblow = np.array([np.percentile(pdatargb[j], percentiles_low[j]) for j in range(3)])
     rgbhigh = np.array([np.percentile(pdatargb[j], percentiles_high[j]) for j in range(3)])
     return rgblow, rgbhigh
