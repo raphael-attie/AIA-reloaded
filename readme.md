@@ -40,3 +40,26 @@ This framework assumes you know how to download the raw fits files from SDO/AIA.
 An example of the rgb image processing is given in **example_RGBMixer.py_**. It processes the raw fits files by rescaling each channel which correspond to one waveband. Our examples use the wavebands centered at 304 (red channel), 171 (green channel) and 193 Anstrom (blue channel).
 To create movies, see examples in **aia_rgb_movies.py**. A full pipeline example is given in **script_full_pipeline.py**
 The assignment of these wavebands to these colors is chosen in accordance to general human perception of colors. To that end, we are studying how to best make use of the CIE-based color spaces (e.g: CIELab, CIELuv, ...) which intend to implement as the frontend of the colorization instead of directly acting on the mixing between the RGB components. 
+
+### Getting started
+
+Example using the 3 samples from above. First create an "rgb" directory inside the "aia_data" directory that contains your 3 samples. This example will write an colored image with some default values. 
+
+```python
+import os, glob
+from visualization import RGBMixer
+
+## Create rgb image using the default aia rgb mixer.
+# This example provides the data file paths and output directory
+
+aia_mixer = RGBMixer(
+    data_files = [glob.glob('../aia_data/*.%s*.fits'%wavel) for wavel in ['304', '171', '193']],
+    outputdir = os.path.abspath('../aia_data/rgb/'))
+aia_mixer.set_aia_default()
+
+aia_mixer.process_rgb(0)
+```
+
+The above example processes only one image. If you want to process multiple rgb images from a list of raw fits files (e.g to create a movie), instead of ```aia_mixer.process_rgb(0)``` you would use ```aia_mixer.process_rgb_list(ncores, file_range)``` where e.g: ```file_range = range(200)``` to process images, and ```ncores = 4``` to parralelize over 4 workers. See e.g. **script_full_pipeline** for more examples.
+
+

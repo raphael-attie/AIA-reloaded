@@ -2,7 +2,6 @@ import os, glob
 from visualization import RGBMixer
 
 ## Create rgb image using the default aia rgb mixer.
-
 # This example provides the data file paths and output directory
 
 aia_mixer = RGBMixer(
