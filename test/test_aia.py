@@ -1,7 +1,7 @@
 import os, glob
 import numpy as np
 from calibration import scale_rotate, aiaprep
-from visualization import process_rgb_image
+from visualization import RGBMixer
 
 
 # Testing for any non-zero values at borders
@@ -57,15 +57,17 @@ def setup_function(test_aia_rgb_sample):
 
 
 def test_aia_rgb_sample():
-    data_files = [[glob.glob('../aia_data/*304*.fits')[0]],
-                  [glob.glob('../aia_data/*171*.fits')[0]],
-                  [glob.glob('../aia_data/*193*.fits')[0]]]
 
-    pdatargb = [aiaprep(data_files[j][0], cropsize=4096) for j in range(3)]
-    percentiles = [99.5, 99.99, 99.85]
-    rgbhigh = np.array([np.percentile(pdatargb[j], percentiles[j]) for j in range(3)])
-    _, outputfile = process_rgb_image(0, data_files, rgbhigh, gamma_rgb=[2.8, 2.8, 2.4], btf=0.3, outputdir='../aia_data/')
-    assert os.path.isfile(outputfile)
+    aia_mixer = RGBMixer(
+        data_files=[glob.glob('../aia_data/*.%s*.fits' % wavel) for wavel in ['304', '171', '193']],
+        outputdir=os.path.abspath('../aia_data/rgb/'))
+    aia_mixer.set_aia_default()
+
+    _ = aia_mixer.process_rgb(0)
+
+    outputfile_lab = aia_mixer.filepath_lab + '_%04d.jpeg' % 0
+
+    assert os.path.isfile(outputfile_lab)
 
 
 

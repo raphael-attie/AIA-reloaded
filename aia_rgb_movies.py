@@ -1,5 +1,5 @@
 """
-After generating the RGB images with e.g. aia_rgb_images.py,
+After generating the RGB images
 run any of the examples below to generate a movie with a given resolution and field of view.
 """
 import visualization
