@@ -43,7 +43,8 @@ The assignment of these wavebands to these colors is chosen in accordance to gen
 
 ### Getting started
 
-Example using the 3 samples from above. First create an "rgb" directory inside the "aia_data" directory that contains your 3 samples. This example will write an colored image with some default values. 
+Example using the 3 samples from above that writes a .jpeg file of a colored image with default scaling and color mixing parameters. 
+The .jpeg file is written in the **aia_data** directory where you put the 3 samples.
 
 ```python
 import os, glob
@@ -54,7 +55,7 @@ from visualization import RGBMixer
 
 aia_mixer = RGBMixer(
     data_files = [glob.glob('../aia_data/*.%s*.fits'%wavel) for wavel in ['304', '171', '193']],
-    outputdir = os.path.abspath('../aia_data/rgb/'))
+    outputdir = os.path.abspath('../aia_data/'))
 aia_mixer.set_aia_default()
 
 aia_mixer.process_rgb(0)

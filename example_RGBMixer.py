@@ -6,7 +6,7 @@ from visualization import RGBMixer
 
 aia_mixer = RGBMixer(
     data_files = [glob.glob('../aia_data/*.%s*.fits'%wavel) for wavel in ['304', '171', '193']],
-    outputdir = os.path.abspath('../aia_data/rgb/'))
+    outputdir = os.path.abspath('../aia_data/'))
 aia_mixer.set_aia_default()
 
 _ = aia_mixer.process_rgb(0)
