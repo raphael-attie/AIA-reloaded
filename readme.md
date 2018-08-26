@@ -66,7 +66,7 @@ typically, beamers in conferences are at best at "full HD", i.e 1920x1080. That 
 
 We also provide options to create videos and crop within the full resolution images for close-ups. Nonetheless, even a full resolution jpeg image size is 4.1 MB. if you do not want or do not need to retain the full resolution images and prefer to directly crop them before creating the image series, you can ask for cropped image directly when instantiating the RGBMixer class. For example, to only retain the bottom half of the sun one would add the following optional crop parameter:
 
-```
+```python
 aia_mixer.crop = (slice(0,2048), slice(2048,4095)) # the first slice is over
 
 ```
@@ -75,7 +75,7 @@ To create movies, you'll process multiple rgb images from a list of raw fits fil
 
 Here is an example of full pipeline for processing, say the first 225 images present in your directory and create movie of of the full sun with a square resolution of 1080x1080:
 
-```
+```python
 import os
 import visualization
 
@@ -97,7 +97,7 @@ aia_mixer.process_rgb_list(ncores, file_range)
 '''
 This will be followed by the encoding of the movie with FFMPEG:
 
-'''
+'''python
 ##### Create .mp4 videos
 
 ## full sun rescaled to 1080x1080 px
@@ -112,7 +112,7 @@ Video at: https://youtu.be/LivB3rEmXJQ (make sure you set the maximum resolution
 
 Sometimes some media players work better if you provide videos with a 16:9 or 4:3 geometry. For the video above, we can instead get a padded version, where black stripes will be added on either side of our initial 1080x1080 picture frame to make it a 1920x1080 video. We would just add the extra ```padded_size``` parameter of (1920,1080):
 
-```
+```python
     ## Rectangularly padded to fit 16:9 1920x1080p for optimized youtube streaming
     padded_size = (1920, 1080)
     visualization.encode_video(aia_mixer.outputdir, filename, fps=fps, frame_size=frame_size, padded_size=padded_size)
@@ -125,7 +125,7 @@ The file size of the above videos is ~11 MB.
 
 Another example is if you want a close-up on the sun, so you can view a sub-field of the sun at higher resolution. Here, we crop a 3840x2160 section (which is a 16:9 geometry) off the 4096x4096 frame, and encode this again at 1920x1080, although we do not need to pad anything and exploit thus the full resolution of a typical display. 
 
-```
+```python
     image_pattern_search = "im_lab_0*.jpeg"
     crop = [3840, 2160, 128, 1936]
     frame_size = (1920, 1080)
