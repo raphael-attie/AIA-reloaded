@@ -17,7 +17,6 @@ Main python dependencies:
 * numpy 
 * astropy
 * opencv (version 3.x.x)
-* multiprocessing (optional, for parallel processing)
 * [optional] pytest if you wish to run the unit tests. 
 
 External dependencies:
@@ -37,9 +36,9 @@ If you wish to run the test functions with **pytest**:
 ### How does it work? 
 
 This framework assumes you know how to download the raw fits files from SDO/AIA. 
-An example of the rgb image processing is given in **example_RGBMixer.py_**. After "prepping" the raw fits files (remapping to equal plate scales and rotations if needed), the intensity in each channel is rescaled non-linearly. Our examples use the wavebands centered at 304 (red channel), 171 (green channel) and 193 Anstrom (blue channel). Default rescaling parameters are provided but the method is meant to accept your own color mixing and rescaling parameters. 
+An example of the rgb image processing is given in **example_RGBMixer.py_**. After calibrating the raw fits files (remapping to equal plate scales and rotations if needed), the intensity in each channel is rescaled non-linearly. Our examples use the wavebands centered at 304 (red channel), 171 (green channel) and 193 Anstrom (blue channel). Default rescaling parameters are provided but the method is meant to accept your own color mixing and rescaling parameters. 
 To create movies, see examples in **aia_rgb_movies.py**. A full pipeline example is given in **script_full_pipeline.py**
-The assignment of these wavebands to these colors is chosen in accordance to general human perception of colors. To that end, we are studying how to best make use of the CIE-based color spaces (e.g: CIELab, CIELuv, ...) which intend to implement as the frontend of the colorization instead of directly acting on the mixing between the RGB components. 
+The assignment of these wavebands to these colors is chosen in accordance to general human perception of colors. To that end, we are studying how to best make use of the CIE-based color spaces (e.g: CIELab, CIELuv, ...) instead of directly acting on the mixing between the RGB components which is not always the most intuitive or natural way to obtain the results we want. 
 
 ### Getting started
 
