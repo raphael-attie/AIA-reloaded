@@ -23,41 +23,42 @@ import visualization
 # E.g., if you have 8 cores in your computer (whether virtual cores or physical cores). Use maximum ncores = 6
 ncores = 4
 # List of file numbers to process.
-file_range = range(8)
-
+file_range = range(225)
 
 if __name__ == '__main__':
 
     aia_mixer = visualization.RGBMixer(
         data_dir=os.path.expanduser('~/Data/SDO/AIA/event_2012_08_31/'),
         wavel_dirs=['304', '171', '193'],
-        outputdir=os.path.abspath('../aia_data/rgb/'))
+        outputdir=os.path.abspath('../aia_data/'))
     aia_mixer.set_aia_default()
+    aia_mixer.filename_lab = 'im_lab'
 
     aia_mixer.process_rgb_list(ncores, file_range)
 
 
-    ## Create .mp4 videos
+    ##### Create .mp4 videos
 
-    # Set the image pattern search. Default here uses the default file names of the class above.
-    # Image numbers must all be padded equally.
-    image_pattern_search = "im_lab_*.jpeg"
-
-    # Create video With a 16:9 aspect ratio, crop over 3840 x 2160 around bottom half
-    # and output at full HD resolution (1920 x 1080) at 30 frames per second.
-    crop = [3840, 2160, 128, 1935]
-    frame_size = (1920, 1080)
-    movie_filename = 'rgb_movie_3840x2160_1920x1080'
-    fps = 30
-    # Encode movie
-    command = visualization.encode_video(aia_mixer.outputdir, movie_filename, crop=crop, frame_size=frame_size, image_pattern_search=image_pattern_search)
-
-
-    # full sun rescaled to 1080x1080 and padded to 1920 x 1080 for optimized youtube videos
+    ## full sun rescaled to 1080x1080 px
     frame_size = (1080, 1080)
-    padded_size = (1920, 1080)
-    filename = 'rgb_movie_full_padded_1920_1080'
-    # Number of frames per second
-    fps = 30
-    # Encode movie
-    visualization.encode_video(aia_mixer.outputdir, filename, fps=fps, frame_size=frame_size, padded_size=padded_size)
+    filename = 'rgb_movie_full_sun_1080x1080'
+    fps = 30  # Number of frames per second
+    visualization.encode_video(aia_mixer.outputdir, filename, fps=fps, frame_size=frame_size)
+
+    ## Rectangularly padded to fit 16:9 1920x1080p for optimized youtube streaming
+    # padded_size = (1920, 1080)
+    # filename = 'rgb_movie_full_sun_1080x1080_padded_1920_1080'
+    # visualization.encode_video(aia_mixer.outputdir, filename, fps=fps, frame_size=frame_size, padded_size=padded_size)
+
+
+    ### Create video With a 16:9 aspect ratio, crop over 3840 x 2160 around bottom half
+    ### and output at full HD resolution (1920 x 1080) at 30 frames per second.
+    # image_pattern_search = "im_lab_0*.jpeg"
+    # crop = [3840, 2160, 128, 1936]
+    # frame_size = (1920, 1080)
+    # movie_filename = 'rgb_movie_3840x2160_1920x1080'
+    # fps = 30
+    # # Encode movie
+    # command = visualization.encode_video(aia_mixer.outputdir, movie_filename, crop=crop, frame_size=frame_size, image_pattern_search=image_pattern_search)
+    #
+

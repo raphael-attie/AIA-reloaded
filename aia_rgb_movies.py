@@ -38,10 +38,10 @@ if __name__ == '__main__':
     # With a 16:9 aspect ratio, crop over 3840 x 2160 around bottom half and output at full HD resolution (1920 x 1080)
     crop = [3840, 2160, 128, 1935]
     frame_size = (1920, 1080)
-    filename = 'rgb_movie_3840x2160_1920x1080_crf_18'
+    filename = 'rgb_movie_3840x2160_1920x1080'
     fps = 30
     # Encode movie
-    visualization.encode_video(images_dir, filename, crop=crop, frame_size=frame_size)
+    command = visualization.encode_video(images_dir, filename, crop=crop, frame_size=frame_size)
 
 
     # With a 16:9 aspect ratio, crop over 3840 x 2160 around bottom half and output at full resolution

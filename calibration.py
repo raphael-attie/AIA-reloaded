@@ -2,6 +2,8 @@ import numpy as np
 import cv2
 from astropy.io import fits
 
+# The aia image size is fixed by the size of the detector. For AIA raw data, this has no reason to change.
+aia_image_size = 4096
 
 def scale_rotate(image, angle=0, scale_factor=1, reference_pixel=None):
     """
@@ -55,7 +57,7 @@ def scale_rotate(image, angle=0, scale_factor=1, reference_pixel=None):
     return rotated_image
 
 
-def aiaprep(fitsfile, cropsize=None):
+def aiaprep(fitsfile, cropsize=aia_image_size):
 
     hdul = fits.open(fitsfile)
     hdul[1].verify('silentfix')
