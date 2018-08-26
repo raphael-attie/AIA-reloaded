@@ -132,7 +132,7 @@ Another example is if you want a close-up on the sun, so you can view a sub-fiel
     movie_filename = 'rgb_movie_3840x2160_1920x1080'
     fps = 30
     # Encode movie
-    command = visualization.encode_video(aia_mixer.outputdir, movie_filename, crop=crop, frame_size=frame_size, image_pattern_search=image_pattern_search)
+    visualization.encode_video(aia_mixer.outputdir, movie_filename, crop=crop, frame_size=frame_size, image_pattern_search=image_pattern_search)
 
 ```
 Video at: https://youtu.be/CqIhzQMOLRw
