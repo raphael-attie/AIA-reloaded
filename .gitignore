@@ -4,6 +4,7 @@
 # pyCharm specific
 .pytest_cache/
 __pycache__/
+readme.md
 
 # User-specific stuff
 .idea/**/workspace.xml
