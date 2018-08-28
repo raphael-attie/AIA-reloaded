@@ -119,8 +119,8 @@ Sometimes some media players work better if you provide videos with a 16:9 or 4:
 ```
 Video at: https://youtu.be/XyqYKlLQZ8o (make sure you set the maximum resolution on the player)
 
-Having such 16:9 ratio usually enables your computer to decode and play the video more efficiently than a less "standard" geometry. 4:3 is also a standard geometry that plays nicely in modest computers and older softwares. However, Youtube players work best at 16:9 and uploading those online will make maximize quality, as they would otherwise be re-encoded by Youtube to fit their 16:9 players. For such complex images, this can lead to unexpected results due to the use of (sometimes) lossy compression schemes. It is best to do that conversion from the source images like we showed above. In addition, the file size should be the same, as the padding only add zeros. 
-The file size of the above videos is ~11 MB. 
+Having such 16:9 ratio usually enables your computer to decode and play the video more efficiently than a less "standard" geometry. 4:3 is also a standard geometry that plays nicely in modest computers and older softwares. Youtube players work best at 16:9. The file size is the same, as the padding only add zeros. 
+The file size of the above videos is ~5.5 MB. 
 
 Another example is if you want a close-up on the sun, so you can view a sub-field of the sun at higher resolution. Here, we crop a 3840x2160 section (which is a 16:9 geometry) off the 4096x4096 frame, and encode this again at 1920x1080, although we do not need to pad anything and exploit thus the full resolution of a typical display. 
 
@@ -136,7 +136,7 @@ Another example is if you want a close-up on the sun, so you can view a sub-fiel
 ```
 Video at: https://youtu.be/CqIhzQMOLRw
 
-As we have more information in this 1920x1080 than above, the file size is a bit bigger, ~15 MB. Considering we had 225 images of ~4.1 MB, that would result in nearly 1 GB of uncompressed video size for the full sun, for virtually no difference in how the images are rendedered on a typical full HD display!
+As we have more information in this 1920x1080 than above, the file size is a bit bigger, ~15 MB. Considering we had 225 images of ~4.1 MB, that would have resulted in nearly 1 GB of uncompressed video size for the full sun, for virtually no difference in how the images are rendedered on a typical full HD display!
 
 
 
