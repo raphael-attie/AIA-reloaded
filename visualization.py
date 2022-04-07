@@ -12,8 +12,7 @@ cv2.setNumThreads(0)
 
 
 class RGBMixer:
-    """
-    Automate the creation of AIA rgb images.
+    """ Automate the creation of AIA rgb images.
     The intensity in each channel is scaled to exploit the high dynamic range of the images using default tone-mapping values.
     Next, ffmpeg is called to create a movie from the jpeg files.
     """
@@ -92,8 +91,6 @@ class RGBMixer:
         # Reference rgb image used for the intensity scaling values
         self.ref_rgb = None
 
-
-
     def set_aia_default(self):
 
         # Load and prep reference image
@@ -113,7 +110,6 @@ class RGBMixer:
         self.filename_lab = 'im_lab'
         self.set_ref_low_high()
 
-
     def set_ref_low_high(self, plow=None, phigh=None):
 
         if plow is None:
@@ -124,18 +120,8 @@ class RGBMixer:
         self.rgblow = np.array([np.percentile(self.ref_rgb[j], plow[j]) for j in range(3)])
         self.rgbhigh = np.array([np.percentile(self.ref_rgb[j], phigh[j]) for j in range(3)])
 
-
     def process_rgb(self, image_index):
-        # Setup which image version to output. Can be either just rgb, just lab, or both
-        if self.filename_rgb is not None:
-            self.filepath_rgb = os.path.join(self.outputdir, self.filename_rgb)
-        else:
-            self.filepath_rgb = None
-
-        if self.filename_lab is not None:
-            self.filepath_lab = os.path.join(self.outputdir, self.filename_lab)
-        else:
-            self.filepath_lab = None
+        """Setup which image version to output. Can be either just rgb, just lab, or both"""
 
         bgr_stack1, bgr_stack2 = process_rgb_image(image_index, data_files=self.data_files,
                                                    rgblow=self.rgblow, rgbhigh=self.rgbhigh, scalemin=self.scalemin,
@@ -217,7 +203,6 @@ def scale_rgb(rgb, rgblow, rgbhigh, gamma_rgb=(2.8, 2.8, 2.4), rgbmix=None, scal
     # Contrast stretch in RGB space
     rgb_stack = (rgb_stack- scalemin) * 255 / (255 - scalemin)
     rgb_stack.clip(0, 255, out=rgb_stack)
-
 
     return rgb_stack
 
