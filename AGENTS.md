@@ -1,5 +1,7 @@
 # Agent Instructions
 
+Read the README.md file for instructions on how to use the project.
+
 ## Python Environment
 
 Always use the project's virtual environment located at `.venv` (Python 3.13) for any task requiring Python, package management, or running tests/scripts:

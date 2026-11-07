@@ -18,6 +18,7 @@ Main python dependencies:
 * astropy
 * opencv (version 3.x.x or 4.x.x)
 * hvpy and tqdm (for downloading pre-calibrated JPEG2000 `.jp2` files via `get_data.py`)
+* [optional] dash (for running the interactive perceptual LCh / RGB mixer app `interactive_rgb_mixer.py`)
 * [optional] pytest if you wish to run the unit tests. 
 
 External dependencies:
@@ -208,10 +209,36 @@ fps = 30
 visualization.encode_video(aia_mixer.outputdir, movie_filename, fps=fps, crop=crop, frame_size=frame_size)
 ```
 
+---
 
+### Interactive Perceptual LCh & RGB Mixer (`interactive_rgb_mixer.py`)
 
+Directly tuning the 9 raw coefficients of the $3 \times 3$ `self.rgbmix` matrix can be unintuitive. `interactive_rgb_mixer.py` provides a local **Plotly Dash** web application that decomposes the 3 columns of `self.rgbmix` into a linear perceptual **Oklch** opponent color space (**Hue** angle $H^\circ$, **Chroma / Saturation** $C$, and **Luminance / Lightness** $L$) and maps any adjustment back into a drop-in $3 \times 3$ `self.rgbmix` matrix for `visualization.py`.
 
+#### Launching the app
 
+```bash
+python interactive_rgb_mixer.py
+```
 
+Then open **http://127.0.0.1:8050** in your browser (by default it loads the three sample `.jp2` files in `samples/`, or pass `--samples-dir /path/to/jp2_folder` and `--port 8050`).
 
+#### Key features
+
+* **Auto-Balance Rules (Data-Driven, Color-Constancy & Color Harmony):** One-click presets computed from the on-disk pixels of the loaded `.jp2` images. Every preset is scaled so that the brightest 0.5% of actual on-disk pixels just reach full scale (no co-located-peak approximation):
+  1. **G2V Gray-World:** Solves for (non-negative) channel chromas against on-disk mean intensities so the disk-mean color is a warm G2V solar white.
+  2. **Warm–Cool Harmony:** Split-complementary thermal ordering placing `304 Å` at vermilion-orange ($24^\circ$) and `171 Å` at amber-gold ($106^\circ$), opposed by `193 Å` at complementary cerulean-blue ($245^\circ$).
+  3. **Equal Salience ($\Delta E$):** Scales each waveband so that a $1\sigma$ fluctuation produces the same color difference, $\sigma_k \lVert(L_k, C_k)\rVert$ = const, so `304 Å` prominences, `171 Å` coronal loops, and `193 Å` plumes contribute equal perceptual contrast (this brightens `193 Å`, giving a cooler palette).
+  4. **120° Oklch Triad:** Spaces the three wavebands $120^\circ$ apart ($18^\circ, 138^\circ, 258^\circ$) with mean-compensated chroma for zero net color cast and maximum chromatic separation.
+  5. **White-Patch (Max-RGB):** Von Kries per-output-channel gains on the default palette so the brightest structures (flares, active-region cores) render neutral white instead of tinted.
+  6. **Gray-Edge:** Color constancy on spatial gradients (van de Weijer et al. 2007): makes the mean color of edges (loops, network boundaries) neutral rather than the mean of all pixels.
+  7. **Decorrelation Stretch:** PCA-based decorrelation stretch (as used for multispectral planetary imagery): whitened opponent-chroma axes give maximal, balanced color separation of inter-waveband differences with zero net disk cast, keeping `304 Å` red and the default luminance.
+* **Option 1 — Global Perceptual LCh (3 Sliders + Color Wheel):**
+  * **Global Hue Shift ($\Delta H^\circ$)**, **Global Chroma ($\times C$)**, and **Global Luminance ($\times L$)** sliders that rotate and scale the color balance across the entire Sun at constant perceptual lightness, paired with a live polar **Oklch Color Wheel** showing the positions of `304`, `171`, and `193`.
+  * The Global Hue colorbar is computed from the rendered Sun itself: the color under the cursor is the dominant (lightness-weighted) hue the Sun takes at that shift, so placing the cursor on red gives a red Sun. The resulting Sun hue is shown next to the slider value.
+* **Option 2 — Per-Waveband LCh Controls (`304 Å`, `171 Å`, `193 Å`):**
+  * Individual **Hue**, **Chroma**, and **Luminance** sliders for each waveband (corresponding to the 3 columns of `self.rgbmix`). Option 1 and Option 2 sliders stay bidirectionally synchronized, and every slider rides directly on a live gradient colorbar with a color-matched thumb.
+* **Real-Time Comparison & Export:**
+  * Switch between Full Sun previews (`1024×1024` / `1536×1536`), a 16:9 bottom-half crop, or 1:1 native pixel zooms on the erupting prominence and active region loops, displayed side-by-side against `set_jp2_default()`.
+  * Copy the live-generated `self.rgbmix = np.array([...])` code snippet directly into `visualization.py`, or click **Save Full 4096×4096 JPEG to `samples/`** to render the full-resolution image via `RGBMixer`.
 
