@@ -87,6 +87,13 @@ class RGBMixer:
         # keep each channel's mean level, so contrast does not also change brightness or color balance.
         self.contrast = 0.0
         self.contrast_mid = 0.5
+        # Spatial enhancement applied to each channel after the tone curve (all off by default):
+        # MGN "structure" weight (multi-scale Gaussian normalization, Morgan & Druckmueller 2014) and
+        # Lightroom-style unsharp mask (amount, radius in full-res pixels, detail = halo allowance %,
+        # masking = edge-mask percentile %). See apply_structure() and unsharp_mask().
+        self.structure = 0.0
+        self.sharpen = (0.0, 1.0, 100.0, 0.0)  # (amount, radius, detail, masking)
+        self.sharpen_mask_thr = None  # optional absolute masking threshold per channel (masking_threshold)
         self.rgbmix = np.array([[1, 0, 0],
                                 [0, 1, 0],
                                 [0, 0, 1]])
@@ -171,6 +178,9 @@ class RGBMixer:
                                                    gamma_rgb=self.gamma_rgb,
                                                    contrast=self.contrast,
                                                    contrast_mid=self.contrast_mid,
+                                                   structure=self.structure,
+                                                   sharpen=self.sharpen,
+                                                   sharpen_mask_thr=self.sharpen_mask_thr,
                                                    rgbmix=self.rgbmix,
                                                    lab=self.lab,
                                                    lmin=self.lmin,
@@ -257,7 +267,107 @@ def mean_preserving_midpoint(x, strength, tol=1e-4):
     return 0.5 * (lo + hi)
 
 
-def scale_rgb(rgb, rgblow, rgbhigh, gamma_rgb=(2.8, 2.8, 2.4), rgbmix=None, scalemin=0, contrast=0.0, contrast_mid=0.5):
+MGN_SIGMAS = (1.25, 2.5, 5.0, 10.0, 20.0, 40.0)  # Gaussian scales in full-resolution pixels (Morgan & Druckmueller 2014)
+MGN_K = 0.7
+
+
+def mgn_detail(x, scale=1.0, sigmas=MGN_SIGMAS, k=MGN_K):
+    """
+    Local component of Multi-scale Gaussian Normalization (Morgan & Druckmueller 2014, Solar Phys. 289, 2945).
+
+    For each Gaussian scale sigma: C = arctan(k * (x - <x>) / sqrt(<(x - <x>)^2>)), with <.> a Gaussian-weighted
+    local mean; the result is the mean over scales, divided by pi/2 so it lies in [-1, 1] (zero-mean).
+    Flat regions (e.g. zero-valued corners) give 0.
+
+    :param x: 2D float32/float64 image in [0, 1]
+    :param scale: image pixels per full-resolution pixel (e.g. 0.25 for a 1024 px view of a 4096 px image), so
+        the scales cover the same physical sizes in previews and in full-resolution output. Scales smaller than
+        half an image pixel are skipped (they carry no information at that sampling).
+    """
+    x = np.asarray(x, dtype=np.float32)
+    acc = np.zeros_like(x)
+    n = 0
+    for s in sigmas:
+        sig = s * scale
+        if sig < 0.5:
+            continue
+        mean = cv2.GaussianBlur(x, (0, 0), sig)
+        d = x - mean
+        sd = np.sqrt(cv2.GaussianBlur(d * d, (0, 0), sig))
+        acc += np.arctan(np.float32(k) * d / np.maximum(sd, np.float32(1e-3)))
+        n += 1
+    return acc / np.float32(max(n, 1) * np.pi / 2)
+
+
+def apply_structure(x, weight, scale=1.0):
+    """Add the MGN local component (mgn_detail) with the given weight (0 = off) and clip to [0, 1]."""
+    if weight <= 1e-6:
+        return x
+    return np.clip(x + np.float32(weight) * mgn_detail(x, scale), 0.0, 1.0).astype(np.asarray(x).dtype, copy=False)
+
+
+def edge_strength(x, radius=1.0, scale=1.0):
+    """Edge strength used by unsharp_mask's masking: gradient magnitude of the image blurred at `radius`
+    (full-res px), expressed per full-resolution pixel so values compare across preview scales."""
+    xf = np.asarray(x, dtype=np.float32)
+    sig = radius * scale
+    blur = cv2.GaussianBlur(xf, (0, 0), sig) if sig >= 0.3 else xf
+    g = np.hypot(cv2.Sobel(blur, cv2.CV_32F, 1, 0, ksize=3), cv2.Sobel(blur, cv2.CV_32F, 0, 1, ksize=3)) / 8.0
+    return g * np.float32(scale)
+
+
+def masking_threshold(x, masking, radius=1.0, scale=1.0):
+    """Absolute edge-strength threshold for unsharp_mask: the `masking` percentile of edge_strength(x)."""
+    g = edge_strength(x, radius, scale)
+    return float(np.percentile(g[:: max(1, g.shape[0] // 1024), :: max(1, g.shape[1] // 1024)], min(masking, 99.9)))
+
+
+def unsharp_mask(x, amount, radius=1.0, detail=100.0, masking=0.0, scale=1.0, mask_threshold=None):
+    """
+    Lightroom-style unsharp mask on a 2D [0, 1] image.
+
+    :param amount: strength (1.0 adds the full high-pass detail x - blur once); 0 = off.
+    :param radius: Gaussian radius (sigma) in full-resolution pixels; multiplied by `scale` for previews.
+    :param detail: halo allowance in % (100 = plain unsharp mask; 0 = no overshoot beyond the local min/max
+        of the neighborhood, which suppresses bright/dark halos around the limb and flare kernels).
+    :param masking: edge mask in % (0 = sharpen everywhere; e.g. 60 = only where the edge strength is above
+        the 60th percentile of the image), keeping smooth / noisy areas such as the off-limb sky unsharpened.
+    :param scale: image pixels per full-resolution pixel. A radius below ~0.3 image pixel has no effect.
+    :param mask_threshold: absolute edge-strength threshold (see masking_threshold). Pass the value computed
+        on the full image so crops, previews and the full-resolution output mask the same structures; when
+        None it is the `masking` percentile of this image.
+    """
+    if amount <= 1e-6:
+        return x
+    x = np.asarray(x)
+    sig = radius * scale
+    if sig < 0.3:
+        return x
+    xf = x.astype(np.float32, copy=False)
+    blur = cv2.GaussianBlur(xf, (0, 0), sig)
+    out = xf + np.float32(amount) * (xf - blur)
+    if detail < 100.0:
+        ksize = 2 * int(np.ceil(sig)) + 1
+        kernel = np.ones((max(ksize, 3), max(ksize, 3)), np.uint8)
+        clamped = np.clip(out, cv2.erode(xf, kernel), cv2.dilate(xf, kernel))
+        out = clamped + np.float32(detail / 100.0) * (out - clamped)
+    if masking > 0.0:
+        g = edge_strength(xf, radius, scale)
+        thr = masking_threshold(xf, masking, radius, scale) if mask_threshold is None else float(mask_threshold)
+        t = np.clip((g - 0.5 * thr) / max(thr, 1e-12), 0.0, 1.0)  # smoothstep from 0.5*thr to 1.5*thr
+        out = xf + (t * t * (3.0 - 2.0 * t)).astype(np.float32) * (out - xf)
+    return np.clip(out, 0.0, 1.0).astype(x.dtype, copy=False)
+
+
+def enhance_channel(x, structure=0.0, sharpen=(0.0, 1.0, 100.0, 0.0), scale=1.0, mask_threshold=None):
+    """Spatial enhancement after the tone curve: MGN structure, then unsharp-mask sharpening."""
+    x = apply_structure(x, structure, scale)
+    amount, radius, detail, masking = sharpen
+    return unsharp_mask(x, amount, radius, detail, masking, scale, mask_threshold)
+
+
+def scale_rgb(rgb, rgblow, rgbhigh, gamma_rgb=(2.8, 2.8, 2.4), rgbmix=None, scalemin=0, contrast=0.0, contrast_mid=0.5,
+              structure=0.0, sharpen=(0.0, 1.0, 100.0, 0.0), sharpen_mask_thr=None):
     """ Rescale the rgb image series.
     First linearly rescales between minimum and maximum values independently on each channel.
     Apply gamma-scaling on the [0-1]-normalized channels.
@@ -273,6 +383,9 @@ def scale_rgb(rgb, rgblow, rgbhigh, gamma_rgb=(2.8, 2.8, 2.4), rgbmix=None, scal
     :param contrast: strength of the sigmoidal contrast applied to each channel after gamma (0 = off).
     :param contrast_mid: pivot of the sigmoidal contrast in the [0, 1] gamma-scaled range: a scalar,
     or one value per channel (see mean_preserving_midpoint).
+    :param structure: weight of the MGN local component added to each channel after the tone curve (0 = off).
+    :param sharpen: (amount, radius, detail, masking) of the unsharp mask applied last (amount 0 = off).
+    :param sharpen_mask_thr: optional absolute masking thresholds, one per channel (see masking_threshold).
     :return: rescaled rgb image as numpy 3D array: [height, width, rgb channels]
     """
 
@@ -285,7 +398,11 @@ def scale_rgb(rgb, rgblow, rgbhigh, gamma_rgb=(2.8, 2.8, 2.4), rgbmix=None, scal
         rgb2[i].clip(0, 1, out=rgb2[i])
 
     mids = np.broadcast_to(np.asarray(contrast_mid, dtype=np.float64), (3,))
-    red, green, blue = [sigmoid_contrast(channel ** gamma, contrast, mid) for (channel, gamma, mid) in zip(rgb2, rgb_gamma, mids)]
+    thrs = [None] * 3 if sharpen_mask_thr is None else list(sharpen_mask_thr)
+    red, green, blue = [
+        enhance_channel(sigmoid_contrast(channel ** gamma, contrast, mid), structure, sharpen, 1.0, thr)
+        for (channel, gamma, mid, thr) in zip(rgb2, rgb_gamma, mids, thrs)
+    ]
 
     # Apply color mixing
     if rgbmix is not None:
@@ -339,7 +456,8 @@ def process_lab_32bit(bgr, lf=1, af=1, bf=1, lmin=0):
     return lab
 
 
-def process_rgb_image(i, data_files, rgblow, rgbhigh, calibrate=True, jp2=False, gamma_rgb=(2.8, 2.8, 2.4), scalemin=0, rgbmix=None, lab=None, lmin=0, crop=None, filename_rgb=None, filename_lab=None, contrast=0.0, contrast_mid=0.5):
+def process_rgb_image(i, data_files, rgblow, rgbhigh, calibrate=True, jp2=False, gamma_rgb=(2.8, 2.8, 2.4), scalemin=0, rgbmix=None, lab=None, lmin=0, crop=None, filename_rgb=None, filename_lab=None, contrast=0.0, contrast_mid=0.5,
+                      structure=0.0, sharpen=(0.0, 1.0, 100.0, 0.0), sharpen_mask_thr=None):
     """
     Create an rgb image out of three fits or jp2 files at different wavelengths, conveniently scaled for visualization.
 
@@ -374,7 +492,8 @@ def process_rgb_image(i, data_files, rgblow, rgbhigh, calibrate=True, jp2=False,
 
     # Apply hdr tone-mapping
     im_rgb255 = scale_rgb(pdatargb, rgblow, rgbhigh, gamma_rgb=gamma_rgb, scalemin=scalemin, rgbmix=rgbmix,
-                          contrast=contrast, contrast_mid=contrast_mid)
+                          contrast=contrast, contrast_mid=contrast_mid, structure=structure, sharpen=sharpen,
+                          sharpen_mask_thr=sharpen_mask_thr)
 
     # OpenCV orders channels as B,G,R instead of R,G,B. FITS files also need to be flipped upside down.
     if jp2:

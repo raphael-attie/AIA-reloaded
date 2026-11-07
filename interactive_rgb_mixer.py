@@ -24,6 +24,9 @@ import copy
 import glob
 import json
 import re
+import threading
+from collections import OrderedDict
+from typing import NamedTuple
 import os
 import time
 import cv2
@@ -516,7 +519,7 @@ def generate_color_wheel_uri(size: int = 148) -> str:
     gray = np.full_like(vivid, 0.50)
     rgb = (1.0 - r_clamped) * gray + r_clamped * vivid
 
-    bg = np.array([30.0 / 255.0, 41.0 / 255.0, 59.0 / 255.0])
+    bg = np.array([17.0 / 255.0, 17.0 / 255.0, 17.0 / 255.0])  # wheel corner color = panel background (#111111)
     alpha = np.clip((1.0 - r) * (size / 3.0), 0.0, 1.0)[..., None]
     comp = rgb * alpha + bg * (1.0 - alpha)
     bgr_u8 = (comp[:, :, ::-1] * 255.0).astype(np.uint8)
@@ -555,13 +558,19 @@ def _svg_uri(svg: str) -> str:
 
 
 # Eye icons for the per-channel visibility toggles (open = channel shown, closed = hidden).
+# Placeholder thumbnail for an empty R/G/B slot.
+EMPTY_CHANNEL_URI = _svg_uri(
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><rect width="100" height="100" fill="#0b1220"/>'
+    '<circle cx="50" cy="50" r="38" fill="none" stroke="#2a2a2a" stroke-width="2" stroke-dasharray="5 5"/>'
+    '<text x="50" y="55" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#525252">empty</text></svg>'
+)
 EYE_OPEN_URI = _svg_uri(
-    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#e2e8f0" '
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#e5e5e5" '
     'stroke-width="2" stroke-linecap="round" stroke-linejoin="round">'
     '<path d="M2 12s3.6-6.5 10-6.5S22 12 22 12s-3.6 6.5-10 6.5S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></svg>'
 )
 EYE_CLOSED_URI = _svg_uri(
-    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#94a3b8" '
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#a3a3a3" '
     'stroke-width="2" stroke-linecap="round" stroke-linejoin="round">'
     '<path d="M2 10c2.7 3.6 6.1 5.4 10 5.4s7.3-1.8 10-5.4"/>'
     '<path d="M5.5 13.6 4 16M9.5 15.2 9 18M14.5 15.2 15 18M18.5 13.6 20 16"/></svg>'
@@ -620,14 +629,55 @@ def _encode_uri(bgr_u8: np.ndarray, jpeg_quality: int = 92) -> str:
     return f"data:image/jpeg;base64,{b64}"
 
 
+# Image pixels per full-resolution (4096 px) pixel for each preview view, so spatial filters (sharpening
+# radius, MGN scales) act on the same physical sizes in previews as in the full-resolution output.
+VIEW_SCALE = {
+    "full_1024": 1024 / 4096,
+    "full_1536": 1536 / 4096,
+    "crop_bottom_half": 1280 / 3840,
+    "zoom_prominence": 1.0,
+    "zoom_active_region": 1.0,
+}
+
+
+class ToneParams(NamedTuple):
+    """Per-input-channel processing before mixing: tone curve, then MGN structure, then unsharp mask."""
+
+    gamma: float = 1.0
+    contrast: float = 0.0
+    structure: float = 0.0
+    amount: float = 0.0
+    radius: float = 1.0
+    detail: float = 25.0
+    masking: float = 0.0
+
+    @property
+    def spatial(self) -> bool:
+        return self.structure > 1e-6 or self.amount > 1e-6
+
+    @property
+    def sharpen(self) -> tuple[float, float, float, float]:
+        return (self.amount, self.radius, self.detail, self.masking)
+
+    def key(self) -> tuple:
+        return (round(self.gamma, 3), round(self.contrast, 2), round(self.structure, 3),
+                round(self.amount, 3), round(self.radius, 2), round(self.detail, 1), round(self.masking, 1))
+
+
 class TripletData:
     """Mixing stacks, on-disk statistics and Auto-Balance presets for one (R, G, B) wavelength triplet."""
 
-    def __init__(self, triplet: tuple[str, str, str], channel_views: dict[str, dict[str, np.ndarray]], jp2_files: list[str]):
+    def __init__(self, triplet: tuple, channel_views: dict[str, dict[str, np.ndarray]], jp2_files: list):
+        """`triplet` holds a wavelength per R/G/B slot, or None for an empty slot (an all-zero input)."""
         self.triplet = triplet
         self.jp2_files = jp2_files
+        any_views = channel_views[next(w for w in triplet if w is not None)]
         self.views: dict[str, np.ndarray] = {
-            view_name: np.stack([channel_views[w][view_name] for w in triplet], axis=-1) for view_name in VIEW_NAMES
+            view_name: np.stack(
+                [channel_views[w][view_name] if w is not None else np.zeros_like(any_views[view_name]) for w in triplet],
+                axis=-1,
+            )
+            for view_name in VIEW_NAMES
         }
 
         self._preview = self.views["full_1024"].astype(np.float64)
@@ -635,13 +685,20 @@ class TripletData:
         self.disk_pixels = self._preview[self._mask]
         # Small fixed subsample for per-callback diagnostics (dominant hue, cast, clipping).
         stride = max(1, len(self.disk_pixels) // 40000)
+        self._stride = stride
         self.sample_pixels = self.disk_pixels[::stride].copy()
         # Even smaller subsample for the 26 renders behind the Global Hue colorbar.
         self.track_pixels = self.sample_pixels[::4].copy()
         self._tone_views: dict[tuple, np.ndarray] = {}
+        self._mgn_views: dict[tuple, np.ndarray] = {}
+        self._edge_samples: dict[tuple, list] = {}
         self._presets: dict[tuple, dict[str, dict]] = {}
         self._mids: dict[tuple, np.ndarray] = {}
-        self.presets = self.presets_for(1.0, 0.0)
+
+    @property
+    def presets(self) -> dict[str, dict]:
+        """Presets on the un-toned inputs (computed on first use, so frame changes stay fast)."""
+        return self.presets_for(ToneParams())
 
     def contrast_mid(self, gamma: float, contrast: float) -> np.ndarray:
         """Per-channel pivots of the sigmoidal contrast, chosen so each channel's on-disk mean level
@@ -664,27 +721,85 @@ class TripletData:
         mids = self.contrast_mid(gamma, contrast)
         return np.stack([visualization.sigmoid_contrast(x[..., k], contrast, mids[k]) for k in range(3)], axis=-1)
 
-    def tone_view(self, view_name: str, gamma: float, contrast: float) -> np.ndarray:
-        """Tone-mapped input stack for a view. Only the most recent ones are kept, so hue/chroma
-        drags reuse them."""
-        if abs(gamma - 1.0) < 1e-6 and contrast <= 1e-6:
+    def _mgn_view(self, view_name: str, tp: ToneParams, toned: np.ndarray) -> np.ndarray:
+        """MGN local component of the tone-mapped view (cached: dragging the Structure or sharpening
+        sliders reuses it)."""
+        key = (view_name, round(tp.gamma, 3), round(tp.contrast, 2))
+        if key not in self._mgn_views:
+            if len(self._mgn_views) >= 2:
+                self._mgn_views.pop(next(iter(self._mgn_views)))
+            scale = VIEW_SCALE.get(view_name, 1.0)
+            self._mgn_views[key] = np.stack([visualization.mgn_detail(toned[..., k], scale) for k in range(3)], axis=-1)
+        return self._mgn_views[key]
+
+    def tone_view(self, view_name: str, tp: ToneParams) -> np.ndarray:
+        """Processed input stack for a view: tone curve, MGN structure, unsharp mask (= visualization.scale_rgb,
+        with spatial sizes scaled to the view). Only the most recent results are kept."""
+        if abs(tp.gamma - 1.0) < 1e-6 and tp.contrast <= 1e-6 and not tp.spatial:
             return self.views[view_name]
-        key = (view_name, round(gamma, 3), round(contrast, 2))
+        key = (view_name, *tp.key())
         if key not in self._tone_views:
             if len(self._tone_views) >= 2:
                 self._tone_views.pop(next(iter(self._tone_views)))
-            self._tone_views[key] = self.tone(self.views[view_name], gamma, contrast)
+            out = self.tone(self.views[view_name], tp.gamma, tp.contrast)
+            if tp.structure > 1e-6:
+                out = np.clip(out + np.float32(tp.structure) * self._mgn_view(view_name, tp, out), 0.0, 1.0)
+            if tp.amount > 1e-6:
+                scale = VIEW_SCALE.get(view_name, 1.0)
+                thrs = self.mask_thresholds(tp) if tp.masking > 0 else [None] * 3
+                out = np.stack(
+                    [
+                        visualization.unsharp_mask(out[..., k], tp.amount, tp.radius, tp.detail, tp.masking, scale, thrs[k])
+                        for k in range(3)
+                    ],
+                    axis=-1,
+                )
+            self._tone_views[key] = out
         return self._tone_views[key]
 
-    def tone_pixels(self, gamma: float, contrast: float) -> tuple[np.ndarray, np.ndarray]:
-        """(sample, track) pixel subsamples after the tone curve, for diagnostics and the Global Hue colorbar."""
-        return self.tone(self.sample_pixels, gamma, contrast), self.tone(self.track_pixels, gamma, contrast)
+    def mask_thresholds(self, tp: ToneParams) -> list:
+        """Absolute masking thresholds per channel, from the full-resolution channels after the tone curve
+        (MGN structure is not included, to keep this fast). Used by every preview view and by the
+        full-resolution save, so Masking selects the same structures everywhere. The full-res edge
+        strengths are cached per (gamma, contrast, radius); moving the Masking slider only re-takes a percentile."""
+        key = (round(tp.gamma, 3), round(tp.contrast, 2), round(tp.radius, 2))
+        if key not in self._edge_samples:
+            if len(self._edge_samples) >= 2:
+                self._edge_samples.pop(next(iter(self._edge_samples)))
+            mids = self.contrast_mid(tp.gamma, tp.contrast)
+            samples = []
+            for k, f in enumerate(self.jp2_files):
+                if f is None:
+                    samples.append(None)
+                    continue
+                x = (visualization.load_jp2(f) / 255.0).astype(np.float32)
+                if abs(tp.gamma - 1.0) > 1e-6:
+                    x = np.power(x, np.float32(1.0 / tp.gamma))
+                x = visualization.sigmoid_contrast(x, tp.contrast, mids[k])
+                g = visualization.edge_strength(x, tp.radius, 1.0)
+                samples.append(g[::4, ::4].ravel().copy())
+            self._edge_samples[key] = samples
+        return [
+            None if g is None else float(np.percentile(g, min(tp.masking, 99.9)))
+            for g in self._edge_samples[key]
+        ]
 
-    def presets_for(self, gamma: float, contrast: float) -> dict[str, dict]:
-        """Auto-Balance presets computed on the tone-mapped inputs actually being mixed (cached)."""
-        key = (round(gamma, 2), round(contrast, 1))
+    def tone_pixels(self, tp: ToneParams) -> tuple[np.ndarray, np.ndarray]:
+        """(sample, track) on-disk pixel subsamples after processing, for diagnostics and the Global Hue
+        colorbar. Spatial filters need neighbors, so they are taken from the processed full-sun view."""
+        if not tp.spatial:
+            return self.tone(self.sample_pixels, tp.gamma, tp.contrast), self.tone(self.track_pixels, tp.gamma, tp.contrast)
+        sample = self.tone_view("full_1024", tp).astype(np.float64)[self._mask][:: self._stride]
+        return sample, sample[::4]
+
+    def presets_for(self, tp: ToneParams) -> dict[str, dict]:
+        """Auto-Balance presets computed on the processed inputs actually being mixed (cached)."""
+        key = tp.key()
         if key not in self._presets:
-            preview = self.tone(self._preview, *key)
+            if tp.spatial:
+                preview = self.tone_view("full_1024", tp).astype(np.float64)
+            else:
+                preview = self.tone(self._preview, tp.gamma, tp.contrast)
             self._presets[key] = compute_auto_balance_presets(preview[self._mask])
         return self._presets[key]
 
@@ -692,13 +807,12 @@ class TripletData:
         self,
         view_name: str,
         rgbmix: np.ndarray,
-        gamma: float = 1.0,
-        contrast: float = 0.0,
+        tp: ToneParams = ToneParams(),
         scalemin: float = 0.0,
         jpeg_quality: int = 92,
     ) -> str:
-        """Apply the input tone curve and the 3x3 rgbmix to the cached float32 stack; return a JPEG data URI."""
-        mixed = self.tone_view(view_name, gamma, contrast) @ rgbmix.astype(np.float32).T
+        """Apply the per-channel processing and the 3x3 rgbmix to the cached float32 stack; return a JPEG data URI."""
+        mixed = self.tone_view(view_name, tp) @ rgbmix.astype(np.float32).T
         np.clip(mixed, 0.0, 1.0, out=mixed)
         mixed *= 255.0
         if scalemin > 0:
@@ -720,25 +834,138 @@ class JP2ImageCache:
         self.jp2_by_wavel = jp2_by_wavel
         self.wavelengths = list(jp2_by_wavel)
         self.channel_views: dict[str, dict[str, np.ndarray]] = {}
-        self.channel_uris: dict[str, dict[str, str]] = {}
+        self._channel_uris: dict[tuple[str, str], str] = {}
         for wavel, path in jp2_by_wavel.items():
             full = visualization.load_jp2(path).astype(np.float32) / 255.0
             self.channel_views[wavel] = _make_views(full)
+        self._triplets: dict[tuple, TripletData] = {}
+
+    def channel_uri(self, wavel: str, view_name: str) -> str:
+        """The wavelength alone in its sunpy SDO/AIA colormap (encoded on first request)."""
+        key = (wavel, view_name)
+        if key not in self._channel_uris:
             lut = sunpy_lut_bgr_u8(aia_cmap_name(wavel))
-            self.channel_uris[wavel] = {
-                view_name: _encode_uri(lut[np.round(np.clip(v, 0.0, 1.0) * 255.0).astype(np.uint8)])
-                for view_name, v in self.channel_views[wavel].items()
-            }
-        self._triplets: dict[tuple[str, str, str], TripletData] = {}
+            v = self.channel_views[wavel][view_name]
+            self._channel_uris[key] = _encode_uri(lut[np.round(np.clip(v, 0.0, 1.0) * 255.0).astype(np.uint8)])
+        return self._channel_uris[key]
 
     def get(self, triplet) -> TripletData:
-        triplet = tuple(str(w) for w in triplet)
+        triplet = tuple(norm_wavel(w) for w in triplet)
+        if all(w is None for w in triplet):
+            raise ValueError("at least one R/G/B slot must have a wavelength")
         if triplet not in self._triplets:
             if len(self._triplets) >= self.MAX_TRIPLETS:
                 self._triplets.pop(next(iter(self._triplets)))
-            files = [self.jp2_by_wavel[w] for w in triplet]
+            files = [self.jp2_by_wavel[w] if w is not None else None for w in triplet]
             self._triplets[triplet] = TripletData(triplet, self.channel_views, files)
         return self._triplets[triplet]
+
+
+# -----------------------------------------------------------------------------
+# Data sources: the bundled samples (one frame) and event folders written by get_data.py
+# (<data_dir>/event_*/<wavelength>/*.jp2, one file per frame). Frames are loaded on demand.
+# -----------------------------------------------------------------------------
+EMPTY_SLOT = "none"  # dropdown value of an empty R/G/B slot
+_TIMESTAMP_RE = re.compile(r"(\d{4}-\d{2}-\d{2}T\d{6})")
+
+
+def norm_wavel(w):
+    """Dropdown value -> wavelength string, or None for an empty slot."""
+    return None if w in (None, "", EMPTY_SLOT) else str(w)
+
+
+class DataSource:
+    """A set of time-aligned JP2 frames per AIA wavelength."""
+
+    def __init__(self, name: str, label: str, files_by_wavel: dict[str, list[str]], frame_times: list[str], output_dir: str, is_event: bool):
+        self.name = name
+        self.label = label
+        self.files_by_wavel = files_by_wavel
+        self.wavelengths = [w for w in AIA_WAVELENGTHS if w in files_by_wavel]
+        self.frame_times = frame_times
+        self.n_frames = len(frame_times)
+        self.output_dir = output_dir
+        self.is_event = is_event
+
+    def files_for(self, frame: int) -> dict[str, str]:
+        frame = int(np.clip(frame, 0, self.n_frames - 1))
+        return {w: self.files_by_wavel[w][frame] for w in self.wavelengths}
+
+    def frame_label(self, frame: int) -> str:
+        t = self.frame_times[int(np.clip(frame, 0, self.n_frames - 1))]
+        m = re.fullmatch(r"(\d{4}-\d{2}-\d{2})T(\d{2})(\d{2})(\d{2})", t)
+        return f"{m.group(1)} {m.group(2)}:{m.group(3)}:{m.group(4)} UTC" if m else t
+
+
+def samples_source(samples_dir: str) -> DataSource:
+    files = find_sample_jp2_files(samples_dir)
+    return DataSource(
+        "samples", f"Samples ({os.path.basename(os.path.normpath(samples_dir))}/)",
+        {w: [f] for w, f in files.items()}, ["sample"], samples_dir, is_event=False,
+    )
+
+
+def event_source(event_dir: str) -> DataSource | None:
+    """Event folder from get_data.py: one sub-folder per wavelength. Frames are the timestamps
+    (parsed from the file names) present in every channel; if file names carry no timestamp,
+    frames are aligned by sorted order."""
+    per_wavel = {}
+    for w in AIA_WAVELENGTHS:
+        files = sorted(glob.glob(os.path.join(event_dir, w, "*.jp2")))
+        if files:
+            per_wavel[w] = files
+    if not per_wavel:
+        return None
+    stamped = {w: {m.group(1): f for f in fs if (m := _TIMESTAMP_RE.search(os.path.basename(f)))} for w, fs in per_wavel.items()}
+    if all(len(stamped[w]) == len(per_wavel[w]) for w in per_wavel):
+        times = sorted(set.intersection(*(set(d) for d in stamped.values())))
+        files_by_wavel = {w: [stamped[w][t] for t in times] for w in per_wavel}
+    else:
+        n = min(len(fs) for fs in per_wavel.values())
+        times = [f"frame {i + 1}" for i in range(n)]
+        files_by_wavel = {w: fs[:n] for w, fs in per_wavel.items()}
+    if not times:
+        return None
+    name = os.path.basename(os.path.normpath(event_dir))
+    label = f"{name}  ({', '.join(files_by_wavel)} Å · {len(times)} frames)"
+    return DataSource(name, label, files_by_wavel, times, os.path.join(event_dir, "mixer_exports"), is_event=True)
+
+
+def discover_sources(samples_dir: str, data_dir: str | None) -> "OrderedDict[str, DataSource]":
+    sources: OrderedDict[str, DataSource] = OrderedDict()
+    sources["samples"] = samples_source(samples_dir)
+    if data_dir and os.path.isdir(data_dir):
+        for event_dir in sorted(glob.glob(os.path.join(data_dir, "event_*"))):
+            src = event_source(event_dir) if os.path.isdir(event_dir) else None
+            if src is not None:
+                sources[src.name] = src
+    return sources
+
+
+class FrameStore:
+    """Loads (source, frame) on demand into a JP2ImageCache; keeps the most recent few."""
+
+    MAX_FRAMES = 3
+
+    def __init__(self, sources: "OrderedDict[str, DataSource]"):
+        self.sources = sources
+        self._frames: OrderedDict[tuple[str, int], JP2ImageCache] = OrderedDict()
+        self._lock = threading.Lock()  # concurrent callbacks must not decode the same frame twice
+
+    def source(self, name: str) -> DataSource:
+        return self.sources.get(name) or next(iter(self.sources.values()))
+
+    def get(self, name: str, frame) -> JP2ImageCache:
+        src = self.source(name)
+        key = (src.name, int(np.clip(int(frame or 0), 0, src.n_frames - 1)))
+        with self._lock:
+            if key in self._frames:
+                self._frames.move_to_end(key)
+            else:
+                if len(self._frames) >= self.MAX_FRAMES:
+                    self._frames.popitem(last=False)
+                self._frames[key] = JP2ImageCache(src.files_for(key[1]))
+            return self._frames[key]
 
 
 def gamma_track_gradient(n_stops: int = 16, faint: float = 0.2) -> str:
@@ -761,7 +988,7 @@ def contrast_track_gradient(n_stops: int = 16) -> str:
 def _format_dark_marks(marks: dict) -> dict:
     """Ensure slider mark labels have light gray contrast on the dark background."""
     return {
-        k: {"label": str(v), "style": {"color": "#cbd5e1", "fontSize": "11px"}}
+        k: {"label": str(v), "style": {"color": "#d4d4d4", "fontSize": "11px"}}
         for k, v in marks.items()
     }
 
@@ -791,7 +1018,7 @@ def _slider_row(
             html.Div(
                 style={"display": "flex", "justifyContent": "space-between", "marginBottom": "2px"},
                 children=[
-                    html.Span(label, id=f"{slider_id}-label", style={"fontSize": "13px", "fontWeight": "600", "color": "#e2e8f0"}),
+                    html.Span(label, id=f"{slider_id}-label", style={"fontSize": "13px", "fontWeight": "600", "color": "#e5e5e5"}),
                     html.Span(
                         id=f"{slider_id}-val",
                         style={"fontSize": "12px", "fontFamily": "monospace", "fontWeight": "600", "color": "#38bdf8"},
@@ -833,12 +1060,12 @@ def _wheel_pin_style(H_deg: float, C: float, swatch_color: str) -> dict:
         "top": f"{y_pct:.1f}%",
         "transform": "translate(-50%, -50%)",
         "backgroundColor": swatch_color,
-        "color": "#0f172a",
+        "color": "#000000",
         "fontWeight": "800",
         "fontSize": "10px",
         "padding": "2px 5px",
         "borderRadius": "10px",
-        "border": "2px solid #f8fafc",
+        "border": "2px solid #fafafa",
         "boxShadow": "0 1px 4px rgba(0,0,0,0.85)",
         "pointerEvents": "none",
         "whiteSpace": "nowrap",
@@ -867,22 +1094,22 @@ DARK_THEME_INDEX_STRING = """<!DOCTYPE html>
         {%css%}
         <style>
             :root, body {
-                background-color: #0f172a;
-                color: #e2e8f0;
+                background-color: #000000;
+                color: #e5e5e5;
                 margin: 0;
                 padding: 0;
-                --Dash-Text-Primary: #e2e8f0 !important;
-                --Dash-Text-Strong: #f8fafc !important;
-                --Dash-Text-Weak: #cbd5e1 !important;
-                --Dash-Text-Disabled: #94a3b8 !important;
-                --Dash-Stroke-Strong: #64748b !important;
-                --Dash-Stroke-Weak: #334155 !important;
+                --Dash-Text-Primary: #e5e5e5 !important;
+                --Dash-Text-Strong: #fafafa !important;
+                --Dash-Text-Weak: #d4d4d4 !important;
+                --Dash-Text-Disabled: #a3a3a3 !important;
+                --Dash-Stroke-Strong: #525252 !important;
+                --Dash-Stroke-Weak: #2a2a2a !important;
                 --Dash-Fill-Interactive-Strong: #38bdf8 !important;
-                --Dash-Fill-Interactive-Weak: #334155 !important;
-                --Dash-Fill-Inverse-Strong: #1e293b !important;
+                --Dash-Fill-Interactive-Weak: #2a2a2a !important;
+                --Dash-Fill-Inverse-Strong: #111111 !important;
                 --Dash-Fill-Primary-Hover: rgba(56, 189, 248, 0.16) !important;
                 --Dash-Fill-Primary-Active: rgba(56, 189, 248, 0.26) !important;
-                --Dash-Fill-Disabled: #1e293b !important;
+                --Dash-Fill-Disabled: #111111 !important;
             }
             /* Style the dcc.Slider track itself as the Lightroom-style colorbar */
             .color-slider-wrap .dash-slider-root {
@@ -892,7 +1119,7 @@ DARK_THEME_INDEX_STRING = """<!DOCTYPE html>
                 height: 12px !important;
                 border-radius: 6px !important;
                 background: var(--track-bg) !important;
-                border: 1px solid #475569 !important;
+                border: 1px solid #3a3a3a !important;
                 box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.5) !important;
             }
             .color-slider-wrap .dash-slider-range {
@@ -905,6 +1132,34 @@ DARK_THEME_INDEX_STRING = """<!DOCTYPE html>
                 border: 2.5px solid #ffffff !important;
                 box-shadow: 0 0 5px rgba(0, 0, 0, 0.9) !important;
             }
+            /* Frame (time) slider: a visible rail, with the elapsed part highlighted */
+            .frame-slider-wrap .dash-slider-track {
+                height: 6px !important;
+                border-radius: 3px !important;
+                background: #3a3a3a !important;
+            }
+            .frame-slider-wrap .dash-slider-range {
+                background: #8a8a8a !important;
+            }
+            /* Frame number box: same height, text size and border as the ◀ ▶ buttons beside it, and
+               lifted (margin-bottom, like the buttons) so it centers on the rail, not on rail + marks. */
+            .frame-slider-wrap input[type=number] {
+                height: 24px !important;
+                width: 46px !important;
+                box-sizing: border-box !important;
+                padding: 0 4px !important;
+                margin-bottom: 16px !important;
+                font-size: 12px !important;
+                text-align: center !important;
+                color: #e5e5e5 !important;
+                background-color: #000000 !important;
+                border: 1px solid #3a3a3a !important;
+                border-radius: 6px !important;
+            }
+            .frame-slider-wrap .dash-slider-thumb {
+                background-color: #e5e5e5 !important;
+                border: 2px solid #000000 !important;
+            }
             .color-slider-wrap .dash-slider-dot {
                 background-color: rgba(255, 255, 255, 0.35) !important;
                 width: 4px !important;
@@ -914,7 +1169,7 @@ DARK_THEME_INDEX_STRING = """<!DOCTYPE html>
             .dash-slider-mark-outside-selection,
             .rc-slider-mark-text,
             .rc-slider-mark-text-active {
-                color: #cbd5e1 !important;
+                color: #d4d4d4 !important;
                 font-size: 11px !important;
             }
             .dash-dropdown,
@@ -924,9 +1179,9 @@ DARK_THEME_INDEX_STRING = """<!DOCTYPE html>
             .dash-dropdown-option,
             .dash-dropdown-value,
             .dash-dropdown-search {
-                background-color: #1e293b !important;
-                color: #e2e8f0 !important;
-                border-color: #475569 !important;
+                background-color: #111111 !important;
+                color: #e5e5e5 !important;
+                border-color: #3a3a3a !important;
             }
             /* Invisible focus helper of dcc.Dropdown: keep it from overflowing narrow dropdowns
                (the per-channel wavelength selectors) and creating a horizontal page scroll. */
@@ -938,15 +1193,15 @@ DARK_THEME_INDEX_STRING = """<!DOCTYPE html>
                 border-color: #38bdf8 !important;
             }
             .dash-dropdown-option:hover {
-                background-color: #334155 !important;
+                background-color: #2a2a2a !important;
                 color: #ffffff !important;
             }
             label, .dash-radioitems label {
-                color: #e2e8f0 !important;
+                color: #e5e5e5 !important;
                 cursor: pointer;
             }
             .preset-btn:hover {
-                background-color: #334155 !important;
+                background-color: #2a2a2a !important;
                 border-color: #38bdf8 !important;
             }
         </style>
@@ -963,12 +1218,14 @@ DARK_THEME_INDEX_STRING = """<!DOCTYPE html>
 """
 
 
-def create_dash_app(cache: JP2ImageCache, output_dir: str) -> Dash:
+def create_dash_app(store: "FrameStore") -> Dash:
     app = Dash(__name__, title="AIA-Reloaded Interactive RGB / LCh Mixer")
     app.index_string = DARK_THEME_INDEX_STRING
 
-    init_triplet = default_triplet(cache.wavelengths)
-    init_data = cache.get(init_triplet)
+    init_src = store.source("samples")
+    init_cache = store.get(init_src.name, 0)
+    init_triplet = default_triplet(init_src)
+    init_data = init_cache.get(init_triplet)
     init_gh_grad, base_dom_h = global_hue_track(DEFAULT_WB_LCH, init_data.track_pixels, 0.0)
     _, init_gc_grad, init_gl_grad, init_g_swatch = make_triplet_gradients_and_swatch(
         0.0, GLOBAL_H_MIN, GLOBAL_H_MAX,
@@ -997,8 +1254,8 @@ def create_dash_app(cache: JP2ImageCache, output_dir: str) -> Dash:
         wb_cards.append(
             html.Div(
                 style={
-                    "backgroundColor": "#1e293b",
-                    "border": "1px solid #334155",
+                    "backgroundColor": "#111111",
+                    "border": "1px solid #2a2a2a",
                     "borderRadius": "8px",
                     "padding": "12px",
                     "marginBottom": "10px",
@@ -1009,8 +1266,8 @@ def create_dash_app(cache: JP2ImageCache, output_dir: str) -> Dash:
                         children=[
                             html.Div(
                                 children=[
-                                    html.Span(wb["wavel"], id=f"wb-{i}-title", style={"fontWeight": "700", "fontSize": "14px", "color": "#f8fafc"}),
-                                    html.Span(f"  ({wb['role']})", id=f"wb-{i}-role", style={"fontSize": "11px", "color": "#cbd5e1"}),
+                                    html.Span(wb["wavel"], id=f"wb-{i}-title", style={"fontWeight": "700", "fontSize": "14px", "color": "#fafafa"}),
+                                    html.Span(f"  ({wb['role']})", id=f"wb-{i}-role", style={"fontSize": "11px", "color": "#d4d4d4"}),
                                 ]
                             ),
                             html.Div(
@@ -1020,7 +1277,7 @@ def create_dash_app(cache: JP2ImageCache, output_dir: str) -> Dash:
                                     "width": "24px",
                                     "height": "24px",
                                     "borderRadius": "50%",
-                                    "border": "2px solid #cbd5e1",
+                                    "border": "2px solid #d4d4d4",
                                     "backgroundColor": w_swatch,
                                 },
                             ),
@@ -1064,9 +1321,9 @@ def create_dash_app(cache: JP2ImageCache, output_dir: str) -> Dash:
         )
 
     preset_btn_style = {
-        "backgroundColor": "#0f172a",
-        "color": "#e2e8f0",
-        "border": "1px solid #475569",
+        "backgroundColor": "#000000",
+        "color": "#e5e5e5",
+        "border": "1px solid #3a3a3a",
         "borderRadius": "6px",
         "padding": "7px 10px",
         "cursor": "pointer",
@@ -1079,8 +1336,8 @@ def create_dash_app(cache: JP2ImageCache, output_dir: str) -> Dash:
 
     app.layout = html.Div(
         style={
-            "backgroundColor": "#0f172a",
-            "color": "#f1f5f9",
+            "backgroundColor": "#000000",
+            "color": "#f5f5f5",
             "minHeight": "100vh",
             "fontFamily": "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif",
             "padding": "16px 24px",
@@ -1100,7 +1357,7 @@ def create_dash_app(cache: JP2ImageCache, output_dir: str) -> Dash:
                     "display": "flex",
                     "justifyContent": "space-between",
                     "alignItems": "center",
-                    "borderBottom": "1px solid #334155",
+                    "borderBottom": "1px solid #2a2a2a",
                     "paddingBottom": "12px",
                     "marginBottom": "16px",
                 },
@@ -1109,11 +1366,12 @@ def create_dash_app(cache: JP2ImageCache, output_dir: str) -> Dash:
                         children=[
                             html.H2(
                                 "SDO/AIA Interactive Perceptual LCh & RGB Mixer (.jp2)",
-                                style={"margin": "0", "fontSize": "20px", "fontWeight": "700", "color": "#f8fafc"},
+                                style={"margin": "0", "fontSize": "20px", "fontWeight": "700", "color": "#fafafa"},
                             ),
                             html.Div(
-                                f"Loaded samples: {', '.join(os.path.basename(f) for f in cache.jp2_by_wavel.values())}",
-                                style={"fontSize": "12px", "color": "#cbd5e1", "marginTop": "2px"},
+                                loaded_files_text(init_src, 0),
+                                id="loaded-files",
+                                style={"fontSize": "12px", "color": "#d4d4d4", "marginTop": "2px"},
                             ),
                         ]
                     ),
@@ -1125,9 +1383,9 @@ def create_dash_app(cache: JP2ImageCache, output_dir: str) -> Dash:
                                 id="btn-reset",
                                 n_clicks=0,
                                 style={
-                                    "backgroundColor": "#334155",
-                                    "color": "#f8fafc",
-                                    "border": "1px solid #64748b",
+                                    "backgroundColor": "#2a2a2a",
+                                    "color": "#fafafa",
+                                    "border": "1px solid #525252",
                                     "borderRadius": "6px",
                                     "padding": "8px 14px",
                                     "cursor": "pointer",
@@ -1136,8 +1394,9 @@ def create_dash_app(cache: JP2ImageCache, output_dir: str) -> Dash:
                                 },
                             ),
                             html.Button(
-                                "Save Full 4096×4096 JPEG to samples/",
+                                "Save Full-Res JPEG",
                                 id="btn-save-full",
+                                title="Save the current frame at full resolution: samples/ for the samples, <event>/mixer_exports/ for an event",
                                 n_clicks=0,
                                 style={
                                     "backgroundColor": "#0284c7",
@@ -1161,11 +1420,70 @@ def create_dash_app(cache: JP2ImageCache, output_dir: str) -> Dash:
                     # LEFT PANEL: Auto-Balance + Controls + Matrix Output
                     html.Div(
                         children=[
+                            # Data Source Card: bundled samples or an event folder (time series) from get_data.py
+                            html.Div(
+                                style={
+                                    "backgroundColor": "#111111",
+                                    "border": "1px solid #2a2a2a",
+                                    "borderRadius": "8px",
+                                    "padding": "12px 14px 2px 14px",
+                                    "marginBottom": "14px",
+                                },
+                                children=[
+                                    html.Div(
+                                        "Data Source",
+                                        style={"fontWeight": "700", "fontSize": "14px", "color": "#f5f5f5", "marginBottom": "6px"},
+                                    ),
+                                    dcc.Dropdown(
+                                        id="source-select",
+                                        options=[{"label": src.label, "value": name} for name, src in store.sources.items()],
+                                        value=init_src.name,
+                                        clearable=False,
+                                        searchable=False,
+                                        style={"fontSize": "12px", "color": "#e5e5e5", "marginBottom": "8px"},
+                                    ),
+                                    # Row: time slider (left) + ◀ ▶ (right); frame number & time right below.
+                                    # Hidden for single-frame sources (the samples).
+                                    html.Div(
+                                        id="frame-row",
+                                        style=frame_row_style(init_src),
+                                        children=[
+                                            html.Div(
+                                                className="frame-slider-wrap",
+                                                style={"flex": "1", "minWidth": "0"},
+                                                children=dcc.Slider(
+                                                    id="frame-slider",
+                                                    min=0,
+                                                    max=max(init_src.n_frames - 1, 1),
+                                                    step=1,
+                                                    value=0,
+                                                    disabled=init_src.n_frames < 2,
+                                                    marks=frame_marks(init_src),
+                                                    updatemode="mouseup",  # each new frame decodes 3 full-res JP2s (~1 s)
+                                                    # no value tooltip: the number box shows it, and a tooltip would cover the label below
+                                                ),
+                                            ),
+                                            html.Div(
+                                                style={"display": "flex", "gap": "4px", "flexShrink": "0", "marginBottom": "16px"},
+                                                children=[
+                                                    html.Button("◀", id="btn-frame-prev", n_clicks=0, title="Previous frame", className="preset-btn", style=frame_step_btn_style()),
+                                                    html.Button("▶", id="btn-frame-next", n_clicks=0, title="Next frame", className="preset-btn", style=frame_step_btn_style()),
+                                                ],
+                                            ),
+                                        ],
+                                    ),
+                                    html.Div(
+                                        id="frame-label",
+                                        children=frame_label_text(init_src, 0),
+                                        style={"fontSize": "12px", "fontFamily": "monospace", "color": "#38bdf8", "marginBottom": "10px"},
+                                    ),
+                                ],
+                            ),
                             # Auto-Balancing Rules Card
                             html.Div(
                                 style={
-                                    "backgroundColor": "#1e293b",
-                                    "border": "1px solid #a7f3d0",
+                                    "backgroundColor": "#111111",
+                                    "border": "1px solid #2a2a2a",
                                     "borderRadius": "8px",
                                     "padding": "12px 14px",
                                     "marginBottom": "14px",
@@ -1173,11 +1491,11 @@ def create_dash_app(cache: JP2ImageCache, output_dir: str) -> Dash:
                                 children=[
                                     html.Div(
                                         "Auto-Balance Rules & Presets",
-                                        style={"fontWeight": "700", "fontSize": "14px", "color": "#a7f3d0", "marginBottom": "6px"},
+                                        style={"fontWeight": "700", "fontSize": "14px", "color": "#f5f5f5", "marginBottom": "6px"},
                                     ),
                                     html.Div(
                                         "Apply a rule computed from the image statistics, or save / load your Option 1 & Option 2 settings as a .json preset (in presets/):",
-                                        style={"fontSize": "11px", "color": "#cbd5e1", "marginBottom": "10px"},
+                                        style={"fontSize": "11px", "color": "#d4d4d4", "marginBottom": "10px"},
                                     ),
                                     html.Div(
                                         style={"display": "grid", "gridTemplateColumns": "1fr 1fr", "gap": "8px", "marginBottom": "8px"},
@@ -1226,12 +1544,12 @@ def create_dash_app(cache: JP2ImageCache, output_dir: str) -> Dash:
                                         id="auto-balance-desc",
                                         children=init_data.presets["default"]["desc"],
                                         style={
-                                            "backgroundColor": "#0f172a",
-                                            "border": "1px solid #334155",
+                                            "backgroundColor": "#000000",
+                                            "border": "1px solid #2a2a2a",
                                             "borderRadius": "6px",
                                             "padding": "8px 10px",
                                             "fontSize": "11px",
-                                            "color": "#cbd5e1",
+                                            "color": "#d4d4d4",
                                             "lineHeight": "1.45",
                                         },
                                     ),
@@ -1240,8 +1558,8 @@ def create_dash_app(cache: JP2ImageCache, output_dir: str) -> Dash:
                             # Option 1: Global LCh Controls + Color Wheel
                             html.Div(
                                 style={
-                                    "backgroundColor": "#1e293b",
-                                    "border": "1px solid #38bdf8",
+                                    "backgroundColor": "#111111",
+                                    "border": "1px solid #2a2a2a",
                                     "borderRadius": "8px",
                                     "padding": "14px",
                                     "marginBottom": "14px",
@@ -1252,7 +1570,7 @@ def create_dash_app(cache: JP2ImageCache, output_dir: str) -> Dash:
                                         children=[
                                             html.Span(
                                                 "Option 1 — Global Perceptual LCh (3 Sliders)",
-                                                style={"fontWeight": "700", "fontSize": "14px", "color": "#38bdf8"},
+                                                style={"fontWeight": "700", "fontSize": "14px", "color": "#f5f5f5"},
                                             ),
                                             html.Div(
                                                 style={"display": "flex", "alignItems": "center", "gap": "8px"},
@@ -1264,7 +1582,7 @@ def create_dash_app(cache: JP2ImageCache, output_dir: str) -> Dash:
                                                             "width": "22px",
                                                             "height": "22px",
                                                             "borderRadius": "50%",
-                                                            "border": "2px solid #f8fafc",
+                                                            "border": "2px solid #fafafa",
                                                             "backgroundColor": init_g_swatch,
                                                         },
                                                     ),
@@ -1273,9 +1591,9 @@ def create_dash_app(cache: JP2ImageCache, output_dir: str) -> Dash:
                                                         id="btn-reset-global",
                                                         n_clicks=0,
                                                         style={
-                                                            "backgroundColor": "#334155",
-                                                            "color": "#e2e8f0",
-                                                            "border": "1px solid #64748b",
+                                                            "backgroundColor": "#2a2a2a",
+                                                            "color": "#e5e5e5",
+                                                            "border": "1px solid #525252",
                                                             "borderRadius": "4px",
                                                             "padding": "3px 8px",
                                                             "cursor": "pointer",
@@ -1292,8 +1610,8 @@ def create_dash_app(cache: JP2ImageCache, output_dir: str) -> Dash:
                                             "display": "flex",
                                             "alignItems": "center",
                                             "gap": "14px",
-                                            "backgroundColor": "#0f172a",
-                                            "border": "1px solid #334155",
+                                            "backgroundColor": "#000000",
+                                            "border": "1px solid #2a2a2a",
                                             "borderRadius": "8px",
                                             "padding": "10px 12px",
                                             "marginBottom": "12px",
@@ -1308,7 +1626,7 @@ def create_dash_app(cache: JP2ImageCache, output_dir: str) -> Dash:
                                                     "backgroundImage": f"url('{COLOR_WHEEL_URI}')",
                                                     "backgroundSize": "cover",
                                                     "borderRadius": "50%",
-                                                    "border": "1px solid #475569",
+                                                    "border": "1px solid #3a3a3a",
                                                 },
                                                 children=[
                                                     html.Div(
@@ -1320,7 +1638,7 @@ def create_dash_app(cache: JP2ImageCache, output_dir: str) -> Dash:
                                                             "height": "6px",
                                                             "transform": "translate(-50%, -50%)",
                                                             "borderRadius": "50%",
-                                                            "backgroundColor": "#f8fafc",
+                                                            "backgroundColor": "#fafafa",
                                                             "opacity": "0.6",
                                                         }
                                                     ),
@@ -1354,11 +1672,11 @@ def create_dash_app(cache: JP2ImageCache, output_dir: str) -> Dash:
                                                 ],
                                             ),
                                             html.Div(
-                                                style={"fontSize": "11px", "color": "#cbd5e1", "lineHeight": "1.45"},
+                                                style={"fontSize": "11px", "color": "#d4d4d4", "lineHeight": "1.45"},
                                                 children=[
                                                     html.Div(
                                                         "Perceptual Oklch Color Wheel",
-                                                        style={"fontWeight": "700", "color": "#f8fafc", "fontSize": "12px", "marginBottom": "4px"},
+                                                        style={"fontWeight": "700", "color": "#fafafa", "fontSize": "12px", "marginBottom": "4px"},
                                                     ),
                                                     html.Div("• Hue thumb picks the vivid color on the Hue track"),
                                                     html.Div("• Chroma track grades Gray → that exact Hue color"),
@@ -1406,8 +1724,8 @@ def create_dash_app(cache: JP2ImageCache, output_dir: str) -> Dash:
                             html.Details(
                                 open=True,
                                 style={
-                                    "backgroundColor": "#0f172a",
-                                    "border": "1px solid #334155",
+                                    "backgroundColor": "#000000",
+                                    "border": "1px solid #2a2a2a",
                                     "borderRadius": "8px",
                                     "padding": "10px",
                                     "marginBottom": "14px",
@@ -1418,23 +1736,74 @@ def create_dash_app(cache: JP2ImageCache, output_dir: str) -> Dash:
                                         style={
                                             "fontWeight": "700",
                                             "fontSize": "14px",
-                                            "color": "#f8fafc",
+                                            "color": "#fafafa",
                                             "cursor": "pointer",
                                             "marginBottom": "10px",
                                         },
                                     ),
                                     html.Div(
                                         "Each waveband defines one column of self.rgbmix. Sliders move automatically with Option 1 and Auto-Balance rules, and can also be fine-tuned individually.",
-                                        style={"fontSize": "11px", "color": "#cbd5e1", "marginBottom": "10px"},
+                                        style={"fontSize": "11px", "color": "#d4d4d4", "marginBottom": "10px"},
                                     ),
                                     *wb_cards,
+                                ],
+                            ),
+                            # Sharpening & Structure (collapsible, like Option 2): per input channel, after the tone curve
+                            html.Details(
+                                open=True,
+                                style={
+                                    "backgroundColor": "#000000",
+                                    "border": "1px solid #2a2a2a",
+                                    "borderRadius": "8px",
+                                    "padding": "10px",
+                                    "marginBottom": "14px",
+                                },
+                                children=[
+                                    html.Summary(
+                                        "Sharpening & Structure",
+                                        style={"fontWeight": "700", "fontSize": "14px", "color": "#fafafa", "cursor": "pointer", "marginBottom": "10px"},
+                                    ),
+                                    html.Div(
+                                        "Applied to each input channel after the Tone Curve, before mixing (so the mix gets no color fringes). "
+                                        "Radii are in full-resolution pixels: fine sharpening is best judged in the 1:1 zoom views, since "
+                                        "full-sun previews are downsampled 2.7–4×.",
+                                        style={"fontSize": "11px", "color": "#d4d4d4", "marginBottom": "10px"},
+                                    ),
+                                    html.Div(
+                                        "Structure — Multi-scale Gaussian Normalization (MGN)",
+                                        style={"fontSize": "12px", "fontWeight": "700", "color": "#e5e5e5", "marginBottom": "4px"},
+                                    ),
+                                    _slider_row(
+                                        "Structure (MGN weight; 0 = off)", "structure", 0.0, 1.0, 0.01, 0.0,
+                                        {0: "0", 0.25: "0.25", 0.5: "0.5", 0.75: "0.75", 1: "1"}, GRAY_TRACK, "#d4d4d4",
+                                    ),
+                                    html.Div(
+                                        "Sharpening — unsharp mask",
+                                        style={"fontSize": "12px", "fontWeight": "700", "color": "#e5e5e5", "margin": "4px 0"},
+                                    ),
+                                    _slider_row(
+                                        "Amount (0 = off)", "sharp-amount", 0.0, 3.0, 0.05, 0.0,
+                                        {0: "0", 1: "1", 2: "2", 3: "3"}, GRAY_TRACK, "#d4d4d4",
+                                    ),
+                                    _slider_row(
+                                        "Radius (full-res px)", "sharp-radius", 0.5, 4.0, 0.1, 1.0,
+                                        {0.5: "0.5", 1: "1", 2: "2", 3: "3", 4: "4"}, GRAY_TRACK, "#d4d4d4",
+                                    ),
+                                    _slider_row(
+                                        "Detail (halo allowance %; low = halo suppression)", "sharp-detail", 0.0, 100.0, 1.0, 25.0,
+                                        {0: "0", 25: "25", 50: "50", 75: "75", 100: "100"}, GRAY_TRACK, "#d4d4d4",
+                                    ),
+                                    _slider_row(
+                                        "Masking (edge mask %; 0 = sharpen everywhere)", "sharp-masking", 0.0, 100.0, 1.0, 0.0,
+                                        {0: "0", 25: "25", 50: "50", 75: "75", 100: "100"}, GRAY_TRACK, "#d4d4d4",
+                                    ),
                                 ],
                             ),
                             # Resulting self.rgbmix Python snippet
                             html.Div(
                                 style={
-                                    "backgroundColor": "#1e293b",
-                                    "border": "1px solid #334155",
+                                    "backgroundColor": "#111111",
+                                    "border": "1px solid #2a2a2a",
                                     "borderRadius": "8px",
                                     "padding": "12px",
                                 },
@@ -1444,7 +1813,7 @@ def create_dash_app(cache: JP2ImageCache, output_dir: str) -> Dash:
                                         children=[
                                             html.Span(
                                                 "Resulting self.rgbmix Matrix (Copy to visualization.py)",
-                                                style={"fontWeight": "700", "fontSize": "13px", "color": "#a7f3d0"},
+                                                style={"fontWeight": "700", "fontSize": "13px", "color": "#f5f5f5"},
                                             ),
                                             dcc.Clipboard(
                                                 target_id="rgbmix-code",
@@ -1456,8 +1825,8 @@ def create_dash_app(cache: JP2ImageCache, output_dir: str) -> Dash:
                                     html.Pre(
                                         id="rgbmix-code",
                                         style={
-                                            "backgroundColor": "#090d16",
-                                            "color": "#e2e8f0",
+                                            "backgroundColor": "#000000",
+                                            "color": "#e5e5e5",
                                             "padding": "10px",
                                             "borderRadius": "6px",
                                             "fontSize": "12px",
@@ -1468,7 +1837,7 @@ def create_dash_app(cache: JP2ImageCache, output_dir: str) -> Dash:
                                     ),
                                     html.Div(
                                         id="balance-metrics",
-                                        style={"fontSize": "11px", "fontFamily": "monospace", "color": "#cbd5e1", "marginTop": "8px"},
+                                        style={"fontSize": "11px", "fontFamily": "monospace", "color": "#d4d4d4", "marginTop": "8px"},
                                     ),
                                     html.Div(
                                         id="save-status",
@@ -1489,8 +1858,8 @@ def create_dash_app(cache: JP2ImageCache, output_dir: str) -> Dash:
                                     "gap": "16px",
                                     "alignItems": "center",
                                     "justifyContent": "space-between",
-                                    "backgroundColor": "#1e293b",
-                                    "border": "1px solid #334155",
+                                    "backgroundColor": "#111111",
+                                    "border": "1px solid #2a2a2a",
                                     "borderRadius": "8px",
                                     "padding": "10px 16px",
                                     "marginBottom": "14px",
@@ -1499,7 +1868,7 @@ def create_dash_app(cache: JP2ImageCache, output_dir: str) -> Dash:
                                     html.Div(
                                         style={"display": "flex", "alignItems": "center", "gap": "10px"},
                                         children=[
-                                            html.Span("Region / Resolution:", style={"fontSize": "13px", "fontWeight": "600", "color": "#e2e8f0"}),
+                                            html.Span("Region / Resolution:", style={"fontSize": "13px", "fontWeight": "600", "color": "#e5e5e5"}),
                                             dcc.Dropdown(
                                                 id="view-select",
                                                 options=[
@@ -1511,14 +1880,14 @@ def create_dash_app(cache: JP2ImageCache, output_dir: str) -> Dash:
                                                 ],
                                                 value="full_1024",
                                                 clearable=False,
-                                                style={"width": "340px", "fontSize": "13px", "color": "#e2e8f0"},
+                                                style={"width": "340px", "fontSize": "13px", "color": "#e5e5e5"},
                                             ),
                                         ],
                                     ),
                                     html.Div(
                                         style={"display": "flex", "alignItems": "center", "gap": "10px"},
                                         children=[
-                                            html.Span("Comparison:", style={"fontSize": "13px", "fontWeight": "600", "color": "#e2e8f0"}),
+                                            html.Span("Comparison:", style={"fontSize": "13px", "fontWeight": "600", "color": "#e5e5e5"}),
                                             dcc.Dropdown(
                                                 id="compare-mode",
                                                 options=[
@@ -1529,13 +1898,13 @@ def create_dash_app(cache: JP2ImageCache, output_dir: str) -> Dash:
                                                 value="side_by_side",
                                                 clearable=False,
                                                 searchable=False,
-                                                style={"width": "250px", "fontSize": "13px", "color": "#e2e8f0"},
+                                                style={"width": "250px", "fontSize": "13px", "color": "#e5e5e5"},
                                             ),
                                         ],
                                     ),
                                     html.Span(
                                         id="render-timing",
-                                        style={"fontSize": "12px", "fontFamily": "monospace", "color": "#cbd5e1"},
+                                        style={"fontSize": "12px", "fontFamily": "monospace", "color": "#d4d4d4"},
                                     ),
                                 ],
                             ),
@@ -1553,8 +1922,8 @@ def create_dash_app(cache: JP2ImageCache, output_dir: str) -> Dash:
                                             html.Div(
                                                 id="modified-card",
                                                 style={
-                                                    "backgroundColor": "#090d16",
-                                                    "border": "1px solid #38bdf8",
+                                                    "backgroundColor": "#000000",
+                                                    "border": "1px solid #2a2a2a",
                                                     "borderRadius": "8px",
                                                     "padding": "10px",
                                                     "textAlign": "center",
@@ -1562,7 +1931,7 @@ def create_dash_app(cache: JP2ImageCache, output_dir: str) -> Dash:
                                                 children=[
                                                     html.Div(
                                                         "Modified Mix (Live LCh -> self.rgbmix)",
-                                                        style={"fontSize": "13px", "fontWeight": "700", "color": "#38bdf8", "marginBottom": "8px"},
+                                                        style={"fontSize": "13px", "fontWeight": "700", "color": "#f5f5f5", "marginBottom": "8px"},
                                                     ),
                                                     html.Img(
                                                         id="img-modified",
@@ -1574,8 +1943,8 @@ def create_dash_app(cache: JP2ImageCache, output_dir: str) -> Dash:
                                             # contrast to restore the mid-tone contrast that gamma flattens.
                                             html.Div(
                                                 style={
-                                                    "backgroundColor": "#1e293b",
-                                                    "border": "1px solid #334155",
+                                                    "backgroundColor": "#111111",
+                                                    "border": "1px solid #2a2a2a",
                                                     "borderRadius": "8px",
                                                     "padding": "12px 16px 4px 16px",
                                                     "marginTop": "14px",
@@ -1583,7 +1952,7 @@ def create_dash_app(cache: JP2ImageCache, output_dir: str) -> Dash:
                                                 children=[
                                                     html.Div(
                                                         "Tone Curve (applied to each input channel before mixing)",
-                                                        style={"fontWeight": "700", "fontSize": "14px", "color": "#f8fafc", "marginBottom": "8px"},
+                                                        style={"fontWeight": "700", "fontSize": "14px", "color": "#fafafa", "marginBottom": "8px"},
                                                     ),
                                                     _slider_row(
                                                         "Gamma γ — lift faint structures (x → x^(1/γ))",
@@ -1594,7 +1963,7 @@ def create_dash_app(cache: JP2ImageCache, output_dir: str) -> Dash:
                                                         1.0,
                                                         {0.5: "0.5", 1.0: "1.0", 1.5: "1.5", 2.0: "2.0", 2.5: "2.5", 3.0: "3.0"},
                                                         gamma_track_gradient(),
-                                                        "#cbd5e1",
+                                                        "#d4d4d4",
                                                     ),
                                                     _slider_row(
                                                         "Contrast — sigmoidal S-curve, brightness-neutral per channel (0 = off)",
@@ -1605,7 +1974,7 @@ def create_dash_app(cache: JP2ImageCache, output_dir: str) -> Dash:
                                                         0.0,
                                                         {0: "0", 3: "3", 6: "6", 9: "9", 12: "12"},
                                                         contrast_track_gradient(),
-                                                        "#cbd5e1",
+                                                        "#d4d4d4",
                                                     ),
                                                 ],
                                             ),
@@ -1615,8 +1984,8 @@ def create_dash_app(cache: JP2ImageCache, output_dir: str) -> Dash:
                                     html.Div(
                                         id="default-card",
                                         style={
-                                            "backgroundColor": "#090d16",
-                                            "border": "1px solid #334155",
+                                            "backgroundColor": "#000000",
+                                            "border": "1px solid #2a2a2a",
                                             "borderRadius": "8px",
                                             "padding": "10px",
                                             "textAlign": "center",
@@ -1624,7 +1993,7 @@ def create_dash_app(cache: JP2ImageCache, output_dir: str) -> Dash:
                                         children=[
                                             html.Div(
                                                 "Input Channels (sunpy SDO/AIA colormaps)",
-                                                style={"fontSize": "13px", "fontWeight": "600", "color": "#cbd5e1", "marginBottom": "8px"},
+                                                style={"fontSize": "13px", "fontWeight": "600", "color": "#d4d4d4", "marginBottom": "8px"},
                                             ),
                                             html.Div(
                                                 id="channels-stack",
@@ -1642,7 +2011,7 @@ def create_dash_app(cache: JP2ImageCache, output_dir: str) -> Dash:
                                                                         style={
                                                                             "fontWeight": "800",
                                                                             "fontSize": "12px",
-                                                                            "color": "#0f172a",
+                                                                            "color": "#000000",
                                                                             "backgroundColor": slot["color"],
                                                                             "borderRadius": "4px",
                                                                             "padding": "2px 6px",
@@ -1650,11 +2019,11 @@ def create_dash_app(cache: JP2ImageCache, output_dir: str) -> Dash:
                                                                     ),
                                                                     dcc.Dropdown(
                                                                         id=f"ch-select-{k}",
-                                                                        options=[{"label": f"{w} Å", "value": w} for w in cache.wavelengths],
-                                                                        value=init_triplet[k],
+                                                                        options=channel_options(init_src),
+                                                                        value=init_triplet[k] or EMPTY_SLOT,
                                                                         clearable=False,
                                                                         searchable=False,
-                                                                        style={"flex": "1", "minWidth": "0", "fontSize": "12px", "color": "#e2e8f0"},
+                                                                        style={"flex": "1", "minWidth": "0", "fontSize": "12px", "color": "#e5e5e5"},
                                                                     ),
                                                                 ],
                                                             ),
@@ -1664,7 +2033,7 @@ def create_dash_app(cache: JP2ImageCache, output_dir: str) -> Dash:
                                                                 children=[
                                                                     html.Img(
                                                                         id=f"img-channel-{k}",
-                                                                        src=cache.channel_uris[init_triplet[k]]["full_1024"],
+                                                                        src=init_cache.channel_uri(init_triplet[k], "full_1024") if init_triplet[k] else EMPTY_CHANNEL_URI,
                                                                         style={"width": "100%", "objectFit": "contain", "borderRadius": "4px", "display": "block"},
                                                                     ),
                                                                     html.Button(
@@ -1681,8 +2050,8 @@ def create_dash_app(cache: JP2ImageCache, output_dir: str) -> Dash:
                                                                             "position": "absolute",
                                                                             "top": "4px",
                                                                             "right": "4px",
-                                                                            "backgroundColor": "rgba(15, 23, 42, 0.75)",
-                                                                            "border": "1px solid #475569",
+                                                                            "backgroundColor": "rgba(0, 0, 0, 0.7)",
+                                                                            "border": "1px solid #3a3a3a",
                                                                             "borderRadius": "6px",
                                                                             "padding": "3px 4px",
                                                                             "cursor": "pointer",
@@ -1693,7 +2062,7 @@ def create_dash_app(cache: JP2ImageCache, output_dir: str) -> Dash:
                                                             html.Figcaption(
                                                                 channel_caption(k, init_triplet[k]),
                                                                 id=f"ch-caption-{k}",
-                                                                style={"fontSize": "11px", "color": "#cbd5e1", "marginTop": "3px"},
+                                                                style={"fontSize": "11px", "color": "#d4d4d4", "marginTop": "3px"},
                                                             ),
                                                         ],
                                                     )
@@ -1800,6 +2169,9 @@ def create_dash_app(cache: JP2ImageCache, output_dir: str) -> Dash:
         Input("ch-eye-0", "n_clicks"),
         Input("ch-eye-1", "n_clicks"),
         Input("ch-eye-2", "n_clicks"),
+        Input("source-select", "value"),
+        Input("frame-slider", "value"),
+        *[Input(sid, "value") for sid in ENHANCE_SLIDER_IDS],
         State("mixer-state-store", "data"),
         State("preset-upload", "filename"),
     )
@@ -1831,15 +2203,26 @@ def create_dash_app(cache: JP2ImageCache, output_dir: str) -> Dash:
         eye0,
         eye1,
         eye2,
+        source_name,
+        frame,
+        structure,
+        sh_amount,
+        sh_radius,
+        sh_detail,
+        sh_masking,
         store_data,
         upload_filename,
     ):
         t0 = time.perf_counter()
         trigger = ctx.triggered_id
-        data = cache.get((ch0, ch1, ch2))
+        try:
+            data = store.get(source_name, frame).get((ch0, ch1, ch2))
+        except ValueError:  # every slot empty: nothing to mix
+            return (no_update,) * len(ctx.outputs_list)
         gamma = float(gamma) if gamma else 1.0
         contrast = float(contrast) if contrast else 0.0
-        sample_px, track_px = data.tone_pixels(gamma, contrast)
+        tp = make_tone_params(gamma, contrast, structure, sh_amount, sh_radius, sh_detail, sh_masking)
+        sample_px, track_px = data.tone_pixels(tp)
 
         anchor_wb = copy.deepcopy(store_data["anchor_wb"])
         last_synced_wb = copy.deepcopy(store_data["last_synced_wb"])
@@ -1860,7 +2243,11 @@ def create_dash_app(cache: JP2ImageCache, output_dir: str) -> Dash:
         }
 
         # A new wavelength assignment changes the statistics behind the default description.
-        desc_out = data.presets_for(gamma, contrast)["default"]["desc"] if trigger in {"ch-select-0", "ch-select-1", "ch-select-2"} else no_update
+        desc_out = (
+            data.presets_for(tp)["default"]["desc"]
+            if trigger in {"ch-select-0", "ch-select-1", "ch-select-2", "source-select"}
+            else no_update
+        )
         update_wb_sliders = False
         update_global_sliders = False
         clear_upload = no_update
@@ -1882,7 +2269,7 @@ def create_dash_app(cache: JP2ImageCache, output_dir: str) -> Dash:
             update_global_sliders = True
             desc_out = f"Loaded preset '{upload_filename}' (Option 1 & Option 2 sliders)."
         elif trigger in preset_map:
-            preset = data.presets_for(gamma, contrast)[preset_map[trigger]]
+            preset = data.presets_for(tp)[preset_map[trigger]]
             anchor_wb = apply_global_to_anchor(preset["wb_lch"], 0.0, 1.0, 1.0)
             wb_lch = copy.deepcopy(anchor_wb)
             last_synced_wb = copy.deepcopy(wb_lch)
@@ -1918,13 +2305,13 @@ def create_dash_app(cache: JP2ImageCache, output_dir: str) -> Dash:
         # sliders, anchors and the exported matrix are left untouched, so un-hiding restores the mix.
         visible = visibility_mask(eye0, eye1, eye2)
         shown_mix = rgbmix * visible
-        mod_uri = data.render_uri(view_name, shown_mix, gamma, contrast)
+        mod_uri = data.render_uri(view_name, shown_mix, tp)
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
 
         base_mod_style = {}
         base_def_style = {
-            "backgroundColor": "#090d16",
-            "border": "1px solid #334155",
+            "backgroundColor": "#000000",
+            "border": "1px solid #2a2a2a",
             "borderRadius": "8px",
             "padding": "10px",
             "textAlign": "center",
@@ -1944,9 +2331,11 @@ def create_dash_app(cache: JP2ImageCache, output_dir: str) -> Dash:
             "])\n"
             f"self.gamma_rgb = ({gamma:.2f}, {gamma:.2f}, {gamma:.2f})\n"
             f"self.contrast = {contrast:.1f}\n"
-            f"self.contrast_mid = ({', '.join(f'{v:.4f}' for v in data.contrast_mid(gamma, contrast))})"
+            f"self.contrast_mid = ({', '.join(f'{v:.4f}' for v in data.contrast_mid(gamma, contrast))})\n"
+            f"self.structure = {tp.structure:.2f}\n"
+            f"self.sharpen = ({tp.amount:.2f}, {tp.radius:.1f}, {tp.detail:.0f}, {tp.masking:.0f})  # amount, radius, detail, masking"
         )
-        hidden = [f"{w} Å" for w, v in zip((ch0, ch1, ch2), visible) if not v]
+        hidden = [f"{w} Å" for w, v in zip(data.triplet, visible) if w and not v]
         if hidden:
             code_str += f"\n# preview currently hides {', '.join(hidden)} (matrix above is the full mix)"
 
@@ -1977,7 +2366,7 @@ def create_dash_app(cache: JP2ImageCache, output_dir: str) -> Dash:
             "width": "24px",
             "height": "24px",
             "borderRadius": "50%",
-            "border": "2px solid #cbd5e1",
+            "border": "2px solid #d4d4d4",
         }
         for i in range(3):
             wh, wc, wl = wb_lch[i]["H"], wb_lch[i]["C"], wb_lch[i]["L"]
@@ -2039,7 +2428,7 @@ def create_dash_app(cache: JP2ImageCache, output_dir: str) -> Dash:
                 "width": "22px",
                 "height": "22px",
                 "borderRadius": "50%",
-                "border": "2px solid #f8fafc",
+                "border": "2px solid #fafafa",
                 "backgroundColor": g_swatch,
             },
             swatches[0],
@@ -2077,22 +2466,88 @@ def create_dash_app(cache: JP2ImageCache, output_dir: str) -> Dash:
         Input("ch-select-0", "value"),
         Input("ch-select-1", "value"),
         Input("ch-select-2", "value"),
+        Input("source-select", "value"),
+        Input("frame-slider", "value"),
         prevent_initial_call=True,
     )
-    def update_channel_panel(view_name, ch0, ch1, ch2):
+    def update_channel_panel(view_name, ch0, ch1, ch2, source_name, frame):
+        frame_cache = store.get(source_name, frame)
         out = []
-        for k, wavel in enumerate((ch0, ch1, ch2)):
+        for k, wavel in enumerate(norm_wavel(w) for w in (ch0, ch1, ch2)):
+            name = f"{wavel} Å" if wavel else "Empty slot"
             out += [
-                cache.channel_uris[wavel][view_name],
+                frame_cache.channel_uri(wavel, view_name) if wavel else EMPTY_CHANNEL_URI,
                 channel_caption(k, wavel),
-                wavel,
-                f"{wavel} Å",
+                wavel or "—",
+                name,
                 f"  ({waveband_role(k, wavel)})",
-                f"{wavel} Å Hue Angle (H°)",
-                f"{wavel} Å Chroma / Saturation (C)",
-                f"{wavel} Å Luminance Weight (L)",
+                f"{name} Hue Angle (H°)",
+                f"{name} Chroma / Saturation (C)",
+                f"{name} Luminance Weight (L)",
             ]
         return tuple(out)
+
+    # Selecting a data source: R/G/B defaults (event folders: 304 / 171 / 131 when present, else
+    # whatever is available, empty when fewer than 3 channels), channel lists and the frame slider.
+    @app.callback(
+        Output("ch-select-0", "options"),
+        Output("ch-select-1", "options"),
+        Output("ch-select-2", "options"),
+        Output("ch-select-0", "value"),
+        Output("ch-select-1", "value"),
+        Output("ch-select-2", "value"),
+        Output("frame-slider", "max"),
+        Output("frame-slider", "value"),
+        Output("frame-slider", "marks"),
+        Output("frame-slider", "disabled"),
+        Output("frame-row", "style"),
+        Input("source-select", "value"),
+        prevent_initial_call=True,
+    )
+    def on_source_change(source_name):
+        src = store.source(source_name)
+        opts = channel_options(src)
+        trip = [w or EMPTY_SLOT for w in default_triplet(src)]
+        return (opts, opts, opts, *trip, max(src.n_frames - 1, 1), 0, frame_marks(src), src.n_frames < 2, frame_row_style(src))
+
+    # ◀ / ▶ step one frame (typing in the slider's box applies when it loses focus).
+    @app.callback(
+        Output("frame-slider", "value", allow_duplicate=True),
+        Input("btn-frame-prev", "n_clicks"),
+        Input("btn-frame-next", "n_clicks"),
+        State("frame-slider", "value"),
+        State("source-select", "value"),
+        prevent_initial_call=True,
+    )
+    def step_frame(_prev, _next, frame, source_name):
+        src = store.source(source_name)
+        step = -1 if ctx.triggered_id == "btn-frame-prev" else 1
+        new = int(np.clip(int(frame or 0) + step, 0, src.n_frames - 1))
+        return new if new != frame else no_update
+
+    @app.callback(
+        Output("frame-label", "children"),
+        Output("loaded-files", "children"),
+        Input("source-select", "value"),
+        Input("frame-slider", "value"),
+        prevent_initial_call=True,
+    )
+    def update_frame_label(source_name, frame):
+        src = store.source(source_name)
+        return frame_label_text(src, frame or 0), loaded_files_text(src, frame or 0)
+
+    @app.callback(
+        *[Output(f"{sid}-val", "children") for sid in ENHANCE_SLIDER_IDS],
+        *[Input(sid, "value") for sid in ENHANCE_SLIDER_IDS],
+    )
+    def update_enhance_labels(structure, amount, radius, detail, masking):
+        return (
+            f"{float(structure or 0):.2f}" if structure else "off",
+            f"{float(amount or 0):.2f}" if amount else "off",
+            f"{float(radius or 1):.1f} px",
+            f"{float(detail or 0):.0f}%",
+            f"{float(masking or 0):.0f}%" if masking else "off",
+        )
 
     # Save Preset: ask for a filename in the browser, then write the JSON server-side into presets/.
     app.clientside_callback(
@@ -2149,7 +2604,7 @@ def create_dash_app(cache: JP2ImageCache, output_dir: str) -> Dash:
             {"H": float(w2h), "C": float(w2c), "L": float(w2l)},
         ]
         preset = build_preset(
-            store_data["anchor_wb"], wb_lch, float(gh), float(gc), float(gl), (ch0, ch1, ch2), lch_to_rgbmix(wb_lch)
+            store_data["anchor_wb"], wb_lch, float(gh), float(gc), float(gl), tuple(norm_wavel(w) for w in (ch0, ch1, ch2)), lch_to_rgbmix(wb_lch)
         )
         os.makedirs(PRESETS_DIR, exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
@@ -2203,6 +2658,9 @@ def create_dash_app(cache: JP2ImageCache, output_dir: str) -> Dash:
         State("ch-eye-0", "n_clicks"),
         State("ch-eye-1", "n_clicks"),
         State("ch-eye-2", "n_clicks"),
+        State("source-select", "value"),
+        State("frame-slider", "value"),
+        *[State(sid, "value") for sid in ENHANCE_SLIDER_IDS],
         prevent_initial_call=True,
     )
     def save_full_res(
@@ -2224,39 +2682,56 @@ def create_dash_app(cache: JP2ImageCache, output_dir: str) -> Dash:
         eye0,
         eye1,
         eye2,
+        source_name,
+        frame,
+        structure,
+        sh_amount,
+        sh_radius,
+        sh_detail,
+        sh_masking,
     ):
-        triplet = (ch0, ch1, ch2)
+        src = store.source(source_name)
+        frame = int(frame or 0)
+        triplet = tuple(norm_wavel(w) for w in (ch0, ch1, ch2))
+        if all(w is None for w in triplet):
+            return "Nothing to save: all R/G/B slots are empty."
         visible = visibility_mask(eye0, eye1, eye2)
         gamma = float(gamma) if gamma else 1.0
         contrast = float(contrast) if contrast else 0.0
+        tp = make_tone_params(gamma, contrast, structure, sh_amount, sh_radius, sh_detail, sh_masking)
         wb_lch = [
             {"H": float(w0h), "C": float(w0c), "L": float(w0l)},
             {"H": float(w1h), "C": float(w1c), "L": float(w1l)},
             {"H": float(w2h), "C": float(w2c), "L": float(w2l)},
         ]
-        rgbmix = lch_to_rgbmix(wb_lch)
+        rgbmix = lch_to_rgbmix(wb_lch) * visible  # save what the preview shows (hidden channels left out)
+        frame_cache = store.get(src.name, frame)
+        mids = frame_cache.get(triplet).contrast_mid(gamma, contrast)
 
-        mixer = visualization.RGBMixer(
-            data_files=[[cache.jp2_by_wavel[w]] for w in triplet],
-            jp2=True,
-            outputdir=output_dir,
+        # Same pipeline as RGBMixer/process_rgb_image for jp2 (visualization.scale_rgb, then RGB -> BGR),
+        # with the fixed 0..255 input range the preview uses, and all-zero inputs for empty slots.
+        files = src.files_for(frame)
+        raw = [visualization.load_jp2(files[w]) if w else None for w in triplet]
+        shape = next(r.shape for r in raw if r is not None)
+        raw = [r if r is not None else np.zeros(shape) for r in raw]
+        im = visualization.scale_rgb(
+            raw, np.zeros(3), np.full(3, 255.0), gamma_rgb=(gamma, gamma, gamma), rgbmix=rgbmix,
+            contrast=contrast, contrast_mid=tuple(mids), structure=tp.structure, sharpen=tp.sharpen,
+            sharpen_mask_thr=frame_cache.get(triplet).mask_thresholds(tp) if tp.amount > 0 and tp.masking > 0 else None,
         )
-        mixer.set_jp2_default()
-        # Save what the preview shows: hidden channels are left out of the mix.
-        mixer.rgbmix = rgbmix * visible
-        mixer.gamma_rgb = (gamma, gamma, gamma)
-        mixer.contrast = contrast
-        mixer.contrast_mid = tuple(cache.get(triplet).contrast_mid(gamma, contrast))
-        # Write the plain RGB-mixed output (exactly what the preview shows). The default lab=(1,1,1)
-        # path is not an identity: it min/max-stretches the image and round-trips it through an
-        # 8-bit CIELab quantization, so the saved file would differ from the on-screen preview.
-        mixer.lab = None
-        mixer.filename_lab = None
-        hidden = "".join(f"_hide{w}" for w, v in zip(triplet, visible) if not v)
-        mixer.filename_rgb = f"im_custom_lch_jp2_{'_'.join(triplet)}{hidden}_gamma{gamma:.2f}_contrast{contrast:.1f}"
-        mixer.process_rgb(0)
-        out_path = os.path.join(output_dir, f"{mixer.filename_rgb}_0000.jpeg")
-        return f"Saved full 4096×4096 image to: {out_path}"
+        bgr = np.clip(np.flip(im, axis=2), 0, 255).astype(np.uint8)
+
+        hidden = "".join(f"_hide{w}" for w, v in zip(triplet, visible) if w and not v)
+        stem = f"im_custom_lch_jp2_{'_'.join(w or 'none' for w in triplet)}{hidden}_gamma{gamma:.2f}_contrast{contrast:.1f}"
+        if tp.structure > 1e-6:
+            stem += f"_mgn{tp.structure:.2f}"
+        if tp.amount > 1e-6:
+            stem += f"_sharp{tp.amount:.2f}-r{tp.radius:.1f}-d{tp.detail:.0f}-m{tp.masking:.0f}"
+        suffix = src.frame_times[frame] if src.is_event else "0000"
+        os.makedirs(src.output_dir, exist_ok=True)
+        out_path = os.path.join(src.output_dir, f"{stem}_{suffix}.jpeg")
+        cv2.imwrite(out_path, bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+        return f"Saved full {bgr.shape[1]}×{bgr.shape[0]} image to: {out_path}"
 
     return app
 
@@ -2273,18 +2748,90 @@ def find_sample_jp2_files(samples_dir: str) -> dict[str, str]:
     return files
 
 
-def default_triplet(wavelengths: list[str]) -> tuple[str, str, str]:
-    """304/171/193 when available (the set_jp2_default() assignment), else the first three found."""
-    if all(w in wavelengths for w in DEFAULT_TRIPLET):
+EVENT_PREFERRED_TRIPLET = ("304", "171", "131")
+
+
+def default_triplet(src: "DataSource") -> tuple:
+    """Default R/G/B wavelengths for a data source.
+
+    Samples: 304/171/193, the assignment set_jp2_default() is tuned for (else as for events).
+    Event folders: R=304, G=171, B=131 when present; a slot whose preferred channel is missing
+    takes the next available channel (AIA order) not already used; with fewer than 3 channels
+    the remaining slots stay empty (None)."""
+    wavelengths = src.wavelengths
+    if not src.is_event and all(w in wavelengths for w in DEFAULT_TRIPLET):
         return DEFAULT_TRIPLET
-    return tuple(wavelengths[:3])
+    out = [w if w in wavelengths else None for w in EVENT_PREFERRED_TRIPLET]
+    remaining = [w for w in wavelengths if w not in out]
+    for k in range(3):
+        if out[k] is None and remaining:
+            out[k] = remaining.pop(0)
+    return tuple(out)
 
 
-def waveband_role(slot: int, wavel: str) -> str:
+def channel_options(src: "DataSource") -> list[dict]:
+    return [{"label": f"{w} Å", "value": w} for w in src.wavelengths] + [{"label": "— empty —", "value": EMPTY_SLOT}]
+
+
+def frame_marks(src: "DataSource") -> dict:
+    if src.n_frames < 2:
+        return {}
+    idx = sorted({0, (src.n_frames - 1) // 2, src.n_frames - 1})
+    return {i: {"label": src.frame_label(i).split(" ")[1][:5] if src.is_event else str(i + 1), "style": {"color": "#d4d4d4", "fontSize": "11px"}} for i in idx}
+
+
+ENHANCE_SLIDER_IDS = ["structure", "sharp-amount", "sharp-radius", "sharp-detail", "sharp-masking"]
+GRAY_TRACK = "linear-gradient(to right, #262626, #a3a3a3)"
+
+
+def make_tone_params(gamma, contrast, structure, amount, radius, detail, masking) -> "ToneParams":
+    return ToneParams(
+        gamma=float(gamma) if gamma else 1.0,
+        contrast=float(contrast) if contrast else 0.0,
+        structure=float(structure) if structure else 0.0,
+        amount=float(amount) if amount else 0.0,
+        radius=float(radius) if radius else 1.0,
+        detail=float(detail) if detail is not None else 25.0,
+        masking=float(masking) if masking else 0.0,
+    )
+
+
+def frame_row_style(src: "DataSource") -> dict:
+    return {"display": "flex" if src.n_frames > 1 else "none", "alignItems": "center", "gap": "8px"}
+
+
+def frame_step_btn_style() -> dict:
+    return {
+        "backgroundColor": "#000000",
+        "color": "#e5e5e5",
+        "border": "1px solid #3a3a3a",
+        "borderRadius": "6px",
+        "padding": "2px 9px",
+        "cursor": "pointer",
+        "fontSize": "12px",
+    }
+
+
+def frame_label_text(src: "DataSource", frame: int) -> str:
+    if src.n_frames < 2:
+        return "Single frame (samples)"
+    return f"Frame {int(frame) + 1} / {src.n_frames}  ·  {src.frame_label(frame)}"
+
+
+def loaded_files_text(src: "DataSource", frame: int) -> str:
+    files = src.files_for(frame)
+    return f"Loaded: {src.name} — {', '.join(os.path.basename(f) for f in files.values())}"
+
+
+def waveband_role(slot: int, wavel) -> str:
+    if not wavel:
+        return f"{RGB_SLOTS[slot]['name']} Input — empty (no channel assigned)"
     return f"{RGB_SLOTS[slot]['name']} Input — {AIA_ROLES.get(wavel, 'AIA channel')}"
 
 
-def channel_caption(slot: int, wavel: str) -> str:
+def channel_caption(slot: int, wavel) -> str:
+    if not wavel:
+        return f"(empty) → {RGB_SLOTS[slot]['rgb']} input"
     return f"{wavel} Å → {RGB_SLOTS[slot]['rgb']} input  ·  {aia_cmap_name(wavel)}"
 
 
@@ -2295,15 +2842,20 @@ def main():
         default=os.path.abspath("samples"),
         help="Directory containing sample *.<wavelength>.jp2 files, e.g. sample.304.jp2 (default: ./samples)",
     )
+    parser.add_argument(
+        "--data-dir",
+        default=os.path.expanduser("~/data/AIA"),
+        help="Folder holding event_* folders from get_data.py, selectable as data sources (default: ~/data/AIA)",
+    )
     parser.add_argument("--host", default="127.0.0.1", help="Host address (default: 127.0.0.1)")
     parser.add_argument("--port", type=int, default=8050, help="Port number (default: 8050)")
     parser.add_argument("--debug", action="store_true", help="Run Dash in debug mode")
     args = parser.parse_args()
 
-    jp2_files = find_sample_jp2_files(args.samples_dir)
-    print(f"Loading JP2 files: {list(jp2_files.values())}")
-    cache = JP2ImageCache(jp2_files)
-    app = create_dash_app(cache, output_dir=os.path.abspath(args.samples_dir))
+    sources = discover_sources(os.path.abspath(args.samples_dir), args.data_dir)
+    for src in sources.values():
+        print(f"Data source: {src.label}")
+    app = create_dash_app(FrameStore(sources))
     print(f"Starting Dash server at http://{args.host}:{args.port}")
     app.run(host=args.host, port=args.port, debug=args.debug)
 
