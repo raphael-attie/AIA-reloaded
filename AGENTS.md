@@ -12,3 +12,7 @@ Always use the project's virtual environment located at `.venv` (Python 3.13) fo
 - **Activation (if needed in a shell session)**: `source .venv/bin/activate`
 
 Do not use the system Python or global package installations.
+
+## Documentation for coloring the images
+- You can refer to the sunpy package to find the default color mapping used for solar images: https://docs.sunpy.org/en/stable/reference/visualization.html
+

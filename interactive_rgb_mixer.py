@@ -22,6 +22,8 @@ import argparse
 import base64
 import copy
 import glob
+import json
+import re
 import os
 import time
 import cv2
@@ -29,6 +31,9 @@ import numpy as np
 from dash import Dash, Input, Output, State, ctx, dcc, html, no_update
 
 import visualization
+
+# sunpy's standard SDO/AIA colormaps (sunpy.visualization.colormaps; needs `sunpy[visualization]`).
+from sunpy.visualization import colormaps as sunpy_cm
 
 # -----------------------------------------------------------------------------
 # Default JP2 3x3 RGB mixing matrix from visualization.RGBMixer.set_jp2_default
@@ -48,6 +53,13 @@ DEFAULT_JP2_RGBMIX = np.array(
 GLOBAL_H_MIN, GLOBAL_H_MAX = -180.0, 180.0
 GLOBAL_C_MIN, GLOBAL_C_MAX = 0.0, 2.2
 GLOBAL_L_MIN, GLOBAL_L_MAX = 0.2, 2.2
+
+# Input gamma slider bounds: each input channel x in [0, 1] is mapped to x**(1/gamma) before
+# mixing, as visualization.scale_rgb does with RGBMixer.gamma_rgb. gamma > 1 lifts faint loops a
+# lot while bright structures (x near 1) barely change; gamma < 1 deepens faint areas.
+GAMMA_MIN, GAMMA_MAX = 0.5, 3.0
+# Sigmoidal contrast strength (visualization.sigmoid_contrast) applied after gamma; 0 = off.
+CONTRAST_MIN, CONTRAST_MAX = 0.0, 12.0
 
 # Slider bounds for Per-Waveband (Option 2) controls
 WB_H_MIN, WB_H_MAX = 0.0, 360.0
@@ -272,17 +284,20 @@ def global_hue_track(
     gc: float = 1.0,
     gl: float = 1.0,
     n_stops: int = 25,
+    visible: np.ndarray | None = None,
 ) -> tuple[str, float]:
     """
     Build the Global Hue Shift colorbar from the *rendered* Sun: each stop at shift ΔH shows the
     vivid color of the dominant hue the image actually takes at that shift (including gamut
     clipping, which bends a pure rotation for near-neutral palettes). Returns the CSS gradient
     and the rendered dominant hue at the current shift (used for the thumb and C/L tracks).
+    `visible` (3 x 0/1) drops hidden input channels exactly as the preview does.
     """
+    col = np.ones(3) if visible is None else np.asarray(visible, dtype=np.float64)
     stops = np.linspace(GLOBAL_H_MIN, GLOBAL_H_MAX, n_stops)
-    hues = [dominant_hue(lch_to_rgbmix(apply_global_to_anchor(anchor_wb, float(g), gc, gl)), pixels) for g in stops]
+    hues = [dominant_hue(lch_to_rgbmix(apply_global_to_anchor(anchor_wb, float(g), gc, gl)) * col, pixels) for g in stops]
     grad = f"linear-gradient(to right, {', '.join(_rgb_vec_to_css(vivid_rgb_at_hue(h)) for h in hues)})"
-    h_cur = dominant_hue(lch_to_rgbmix(apply_global_to_anchor(anchor_wb, float(gh_cur), gc, gl)), pixels)
+    h_cur = dominant_hue(lch_to_rgbmix(apply_global_to_anchor(anchor_wb, float(gh_cur), gc, gl)) * col, pixels)
     return grad, h_cur
 
 
@@ -357,18 +372,12 @@ def _solve_chroma_for_cast(
     return np.clip(c, 0.0, None)
 
 
-def compute_auto_balance_presets(
-    pixels: np.ndarray,
-    grad_x: np.ndarray,
-    grad_y: np.ndarray,
-) -> dict[str, dict]:
+def compute_auto_balance_presets(pixels: np.ndarray) -> dict[str, dict]:
     """
-    Compute data-driven, color-constancy & color-harmony Auto-Balance presets in the opponent
-    LCh space from real on-disk pixel samples (N, 3) of the [304, 171, 193] channels and their
-    spatial gradients (N, 3) along x and y (for Gray-Edge).
+    Compute the Auto-Balance presets (Warm-Cool Harmony, White-Patch) in the opponent LCh space
+    from real on-disk pixel samples (N, 3) of the selected (R, G, B) input channels.
     """
     means = pixels.mean(axis=0)
-    stds = pixels.std(axis=0)
 
     def _normalize(wb_lch: list[dict[str, float]], target_max: float = 0.98, pct: float = 99.5) -> list[dict[str, float]]:
         # Scale the whole matrix (all L and C uniformly => hues and balance unchanged) so that the
@@ -387,75 +396,16 @@ def compute_auto_balance_presets(
             for w in wb_lch
         ]
 
-    # 1. Gray-World / G2V Solar Equilibrium: disk-mean color = slightly warm white.
-    h_gw = [20.0, 122.0, 250.0]
-    c_gw = _solve_chroma_for_cast(h_gw, means, (0.015, 0.025), 1.05)
-    wb_gw = _normalize([{"H": h_gw[i], "C": float(c_gw[i]), "L": [0.24, 0.72, 0.14][i]} for i in range(3)])
-
-    # 2. Split-Complementary Warm-Cool Harmony
+    # Split-Complementary Warm-Cool Harmony
     h_wc = [24.0, 106.0, 245.0]
     c_wc = _solve_chroma_for_cast(h_wc, means, (0.022, 0.035), 1.02)
     wb_wc = _normalize([{"H": h_wc[i], "C": float(c_wc[i]), "L": [0.26, 0.74, 0.12][i]} for i in range(3)])
 
-    # 3. Iso-Perceptual Contrast (Equal Salience): the color difference produced by a 1-sigma
-    #    fluctuation of waveband k is sigma_k * ||(L_k, C_k)||. Equalize that product across bands
-    #    (the previous version multiplied unequal base vectors by 1/sigma, which left 171 Å with
-    #    ~2x the salience of 193 Å).
-    h_es = [18.0, 120.0, 248.0]
-    base_es = np.array([[0.25, 0.34], [0.62, 0.34], [0.16, 0.28]])  # (L, C) direction per band
-    delta_e = stds * np.linalg.norm(base_es, axis=1)
-    k_es = np.mean(delta_e) / delta_e
-    wb_es = _normalize(
-        [{"H": h_es[i], "C": float(base_es[i, 1] * k_es[i]), "L": float(base_es[i, 0] * k_es[i])} for i in range(3)]
-    )
-
-    # 4. Triadic 120° Maximum Separation (Zero Net Cast): m_k * C_k equal => chroma vectors cancel.
-    h_tr = [18.0, 138.0, 258.0]
-    inv_mean = (1.0 / means) / np.mean(1.0 / means)
-    c_tr = 0.33 * inv_mean
-    wb_tr = _normalize([{"H": h_tr[i], "C": float(c_tr[i]), "L": [0.25, 0.70, 0.15][i]} for i in range(3)])
-
-    # 5. White-Patch (Max-RGB) von Kries correction of the default palette: per-output-channel gains
+    # White-Patch (Max-RGB) von Kries correction of the default palette: per-output-channel gains
     #    so that the brightest structures (99.5th pct of each output channel) render neutral white.
     raw_def = pixels @ DEFAULT_JP2_RGBMIX.T
     p_def = np.maximum(np.percentile(raw_def, 99.5, axis=0), 1e-3)
     wb_wp = _normalize(rgbmix_to_waveband_lch(np.diag(0.98 / p_def) @ DEFAULT_JP2_RGBMIX))
-
-    # 6. Gray-Edge color constancy (van de Weijer et al. 2007) on the default palette: diagonal
-    #    output gains so the mean gradient magnitude of the R, G and B outputs is equal, i.e. the
-    #    average color of *edges* (loops, network boundaries) is neutral, instead of the average of
-    #    all pixels, which is dominated by the large, smooth quiet-Sun disk.
-    e_out = np.mean(np.hypot(grad_x @ DEFAULT_JP2_RGBMIX.T, grad_y @ DEFAULT_JP2_RGBMIX.T), axis=0)
-    g_ge = np.mean(e_out) / np.maximum(e_out, 1e-6)
-    wb_ge = _normalize(rgbmix_to_waveband_lch(np.diag(g_ge) @ DEFAULT_JP2_RGBMIX))
-
-    # 7. Decorrelation Stretch (PCA), the classic multispectral planetary-imaging technique:
-    #    choose the (a, b) opponent rows within the plane orthogonal to the disk-mean vector
-    #    (=> zero net cast), whitened so the two chroma axes are uncorrelated with equal variance
-    #    (=> differences BETWEEN wavebands get maximal, balanced color separation). The (a, b)
-    #    frame is then rotated/reflected so 304 Å stays red and 304 -> 171 -> 193 runs red -> green -> blue.
-    cov = np.cov(pixels, rowvar=False)
-    _, _, vt = np.linalg.svd(means.reshape(1, 3))
-    q = vt[1:].T  # 3x2 orthonormal basis of {r : r . means = 0}
-    evals, evecs = np.linalg.eigh(q.T @ cov @ q)
-    w_ab = q @ evecs @ np.diag(1.0 / np.sqrt(np.maximum(evals, 1e-12)))  # 3x2: chroma vector per waveband
-    lab_def = (pixels @ DEFAULT_JP2_RGBMIX.T) @ T_RGB2LAB.T
-    target_std = 1.25 * float(np.sqrt(0.5 * (lab_def[:, 1].var() + lab_def[:, 2].var())))
-    chroma_cols = (w_ab * target_std).T  # 2x3, column k = (a_k, b_k)
-
-    def _orient(cols: np.ndarray) -> np.ndarray:
-        h = np.arctan2(cols[1], cols[0])
-        rot = np.radians(20.0) - h[0]
-        cr, sr = np.cos(rot), np.sin(rot)
-        out = np.array([[cr, -sr], [sr, cr]]) @ cols
-        hd = np.degrees(np.arctan2(out[1], out[0])) % 360.0
-        return out, (hd[1] - hd[0]) % 360.0 < (hd[2] - hd[0]) % 360.0
-
-    chroma_cols, ordered = _orient(chroma_cols)
-    if not ordered:
-        chroma_cols, _ = _orient(np.diag([1.0, -1.0]) @ chroma_cols)
-    lab_dcs = np.vstack([[w["L"] for w in DEFAULT_WB_LCH], chroma_cols])
-    wb_dcs = _normalize(rgbmix_to_waveband_lch(T_LAB2RGB @ lab_dcs))
 
     m_def = mix_metrics(DEFAULT_JP2_RGBMIX, pixels)
 
@@ -470,42 +420,83 @@ def compute_auto_balance_presets(
                 f"({m_def['p995'][0]:.2f}, {m_def['p995'][1]:.2f}, {m_def['p995'][2]:.2f})."
             ),
         },
-        "gray_world": {
-            "label": "1. G2V Gray-World",
-            "wb_lch": wb_gw,
-            "desc": "Data-Driven Gray-World Equilibrium: Balances channel chromas against on-disk mean intensities so overlapping bright structures sum to warm G2V solar white without clipping.",
-        },
         "warm_cool": {
-            "label": "2. Warm–Cool Harmony",
+            "label": "Warm–Cool Harmony",
             "wb_lch": wb_wc,
             "desc": "Split-Complementary Thermal Harmony: Shifts 171 Å loops to pure Amber-Gold (106°) and 304 Å to Vermilion (24°), opposed by complementary Cerulean-Blue (245°) for the 1.5 MK corona.",
         },
-        "equal_salience": {
-            "label": "3. Equal Salience (ΔE)",
-            "wb_lch": wb_es,
-            "desc": "Iso-Perceptual Contrast: Weights each channel inversely to its image standard deviation (1/σ) so 304 Å prominences, 171 Å loops, and 193 Å plumes have equal visual salience.",
-        },
-        "triadic_120": {
-            "label": "4. 120° Oklch Triad",
-            "wb_lch": wb_tr,
-            "desc": "Maximum Chromatic Separation: Spaces 304, 171, and 193 Å exactly 120° apart (18°, 138°, 258°) with mean-compensated chroma for exact zero net color cast (a=0, b=0).",
-        },
         "white_patch": {
-            "label": "5. White-Patch (Max-RGB)",
+            "label": "White-Patch (Max-RGB)",
             "wb_lch": wb_wp,
             "desc": "Von Kries White-Patch correction of the default palette: per-output-channel gains make the brightest 0.5% of structures (flares, AR cores, limb brightenings) render neutral white instead of tinted, while keeping the default hue ordering.",
         },
-        "gray_edge": {
-            "label": "6. Gray-Edge",
-            "wb_lch": wb_ge,
-            "desc": "Gray-Edge color constancy on the default palette: per-output-channel gains make the mean color of spatial gradients (loop edges, network boundaries) neutral, rather than the mean of all pixels, so fine structure is balanced instead of the smooth quiet-Sun background. Because 193 Å structure is much smoother than the 304 Å network, this yields a cooler palette.",
-        },
-        "decorrelation": {
-            "label": "7. Decorrelation Stretch",
-            "wb_lch": wb_dcs,
-            "desc": "PCA Decorrelation Stretch (multispectral imaging): chroma axes are whitened so inter-waveband differences get maximal, balanced color separation with zero net disk cast; luminance kept from the default, 304 Å kept red.",
+    }
+
+
+# -----------------------------------------------------------------------------
+# Option 1 + Option 2 preset files (JSON), saved under <project>/presets/
+# -----------------------------------------------------------------------------
+PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
+PRESETS_DIR = os.path.join(PROJECT_DIR, "presets")
+PRESET_FORMAT = "aia-reloaded-lch-preset"
+
+
+def preset_path(name: str) -> str:
+    """Validate a user-typed preset filename and return its path inside PRESETS_DIR (.json enforced)."""
+    name = (name or "").strip()
+    if not name.lower().endswith(".json"):
+        name += ".json"
+    stem = name[:-5]
+    if not stem or not re.fullmatch(r"[A-Za-z0-9._ -]+", stem) or stem.startswith("."):
+        raise ValueError("use letters, digits, spaces, '.', '_' or '-' only (no folders)")
+    return os.path.join(PRESETS_DIR, name)
+
+
+def build_preset(anchor_wb, wb_lch, gh, gc, gl, triplet, rgbmix) -> dict:
+    """Serialize Option 1 (global) and Option 2 (per-waveband) settings. `anchor_wb` is the per-waveband
+    state before the global adjustment, so loading restores both slider sets and their coupling."""
+    def _wb(w):
+        return [{"H": round(float(x["H"]), 4), "C": round(float(x["C"]), 5), "L": round(float(x["L"]), 5)} for x in w]
+
+    return {
+        "format": PRESET_FORMAT,
+        "version": 1,
+        "option1_global": {"hue_shift_deg": float(gh), "chroma_scale": float(gc), "luminance_scale": float(gl)},
+        "option2_wavebands": _wb(wb_lch),
+        "anchor_wavebands": _wb(anchor_wb),
+        "info": {
+            "wavelengths_rgb": list(triplet),
+            "rgbmix": np.round(rgbmix, 6).tolist(),
+            "saved_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         },
     }
+
+
+def parse_preset(obj: dict) -> tuple[list[dict[str, float]], tuple[float, float, float]]:
+    """Return (anchor_wb, (gh, gc, gl)) from a preset dict; values are clipped to the slider ranges."""
+    if not isinstance(obj, dict) or obj.get("format") != PRESET_FORMAT:
+        raise ValueError(f"not an {PRESET_FORMAT} file")
+    g = obj["option1_global"]
+    gh = float(np.clip(float(g["hue_shift_deg"]), GLOBAL_H_MIN, GLOBAL_H_MAX))
+    gc = float(np.clip(float(g["chroma_scale"]), GLOBAL_C_MIN, GLOBAL_C_MAX))
+    gl = float(np.clip(float(g["luminance_scale"]), GLOBAL_L_MIN, GLOBAL_L_MAX))
+    src = obj.get("anchor_wavebands")
+    if src is None:  # derive the anchor from the effective per-waveband values
+        src = [
+            {"H": (w["H"] - gh) % 360.0, "C": w["C"] / gc if gc > 1e-6 else w["C"], "L": w["L"] / gl if abs(gl) > 1e-6 else w["L"]}
+            for w in obj["option2_wavebands"]
+        ]
+    if len(src) != 3:
+        raise ValueError("expected 3 wavebands")
+    anchor = [
+        {
+            "H": float(w["H"]) % 360.0,
+            "C": float(np.clip(float(w["C"]), WB_C_MIN, WB_C_MAX)),
+            "L": float(np.clip(float(w["L"]), WB_L_MIN, WB_L_MAX)),
+        }
+        for w in src
+    ]
+    return anchor, (gh, gc, gl)
 
 
 def generate_color_wheel_uri(size: int = 148) -> str:
@@ -536,75 +527,235 @@ def generate_color_wheel_uri(size: int = 148) -> str:
 
 
 DEFAULT_WB_LCH = rgbmix_to_waveband_lch(DEFAULT_JP2_RGBMIX)
+
+# Output channel of each rgbmix column (column k of rgbmix takes the wavelength assigned to slot k).
+RGB_SLOTS = [
+    {"rgb": "R", "name": "Red", "color": "#f87171"},
+    {"rgb": "G", "name": "Green", "color": "#4ade80"},
+    {"rgb": "B", "name": "Blue", "color": "#60a5fa"},
+]
+DEFAULT_TRIPLET = ("304", "171", "193")
+AIA_WAVELENGTHS = ["94", "131", "171", "193", "211", "304", "335", "1600", "1700", "4500"]
+AIA_ROLES = {
+    "94": "Flaring Corona (Fe XVIII, ~6 MK)",
+    "131": "Flare Plasma & Transition Region (Fe VIII / XXI, ~0.4 & 10 MK)",
+    "171": "Quiet Corona & Coronal Loops (Fe IX, ~0.6 MK)",
+    "193": "Corona & Hot Flare Plasma (Fe XII / XXIV, ~1.2 & 20 MK)",
+    "211": "Active-Region Corona (Fe XIV, ~2 MK)",
+    "304": "Chromosphere & Prominences (He II, ~50 kK)",
+    "335": "Active-Region Corona (Fe XVI, ~2.5 MK)",
+    "1600": "Upper Photosphere & Transition Region (C IV)",
+    "1700": "Temperature Minimum & Photosphere (UV continuum)",
+    "4500": "Photosphere (white light)",
+}
+
+
+def _svg_uri(svg: str) -> str:
+    return "data:image/svg+xml;base64," + base64.b64encode(svg.encode("utf-8")).decode("ascii")
+
+
+# Eye icons for the per-channel visibility toggles (open = channel shown, closed = hidden).
+EYE_OPEN_URI = _svg_uri(
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#e2e8f0" '
+    'stroke-width="2" stroke-linecap="round" stroke-linejoin="round">'
+    '<path d="M2 12s3.6-6.5 10-6.5S22 12 22 12s-3.6 6.5-10 6.5S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></svg>'
+)
+EYE_CLOSED_URI = _svg_uri(
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#94a3b8" '
+    'stroke-width="2" stroke-linecap="round" stroke-linejoin="round">'
+    '<path d="M2 10c2.7 3.6 6.1 5.4 10 5.4s7.3-1.8 10-5.4"/>'
+    '<path d="M5.5 13.6 4 16M9.5 15.2 9 18M14.5 15.2 15 18M18.5 13.6 20 16"/></svg>'
+)
+
+
+def channel_visible(n_clicks) -> bool:
+    """Eye toggle state: every click flips it; starts visible."""
+    return not (int(n_clicks or 0) % 2)
+
+
+def visibility_mask(n0, n1, n2) -> np.ndarray:
+    """Column mask for rgbmix: 1 for shown input channels, 0 for hidden ones."""
+    return np.array([1.0 if channel_visible(n) else 0.0 for n in (n0, n1, n2)])
+
+
+def aia_cmap_name(wavel: str) -> str:
+    return f"sdoaia{wavel}"
+
+
+def sunpy_lut_bgr_u8(cmap_name: str) -> np.ndarray:
+    """256-entry BGR uint8 lookup table sampled from a sunpy colormap (for cv2 encoding)."""
+    cmap = sunpy_cm.cmlist.get(cmap_name)
+    if cmap is None:  # no sunpy colormap for this channel: plain grayscale
+        return np.repeat(np.arange(256, dtype=np.uint8)[:, None], 3, axis=1)
+    rgba = cmap(np.linspace(0.0, 1.0, 256))
+    return np.round(rgba[:, 2::-1] * 255.0).astype(np.uint8)
 COLOR_WHEEL_URI = generate_color_wheel_uri(148)
 
 
-class JP2ImageCache:
-    """Pre-loads the three 4096x4096 JP2 channels, computes statistics, and caches fast views."""
+VIEW_NAMES = ["full_1024", "full_1536", "crop_bottom_half", "zoom_prominence", "zoom_active_region"]
 
-    def __init__(self, jp2_files: list[str]):
+
+def _make_views(full: np.ndarray) -> dict[str, np.ndarray]:
+    """Preview views of one full-resolution 4096x4096 image (2D) or stack (3D)."""
+    h, w = full.shape[:2]
+    return {
+        "full_1024": cv2.resize(full, (1024, 1024), interpolation=cv2.INTER_AREA),
+        "full_1536": cv2.resize(full, (1536, 1536), interpolation=cv2.INTER_AREA),
+        "crop_bottom_half": cv2.resize(
+            full[1935 : min(h, 1935 + 2160), 128 : min(w, 128 + 3840)],
+            (1280, 720),
+            interpolation=cv2.INTER_AREA,
+        ),
+        "zoom_prominence": full[2300:3324, 200:1224].copy(),
+        "zoom_active_region": full[1050:2074, 2800:3824].copy(),
+    }
+
+
+def _encode_uri(bgr_u8: np.ndarray, jpeg_quality: int = 92) -> str:
+    """Encode a BGR uint8 image as a base64 JPEG data URI."""
+    ok, buf = cv2.imencode(".jpg", bgr_u8, [int(cv2.IMWRITE_JPEG_QUALITY), jpeg_quality])
+    if not ok:
+        raise RuntimeError("Failed to encode preview image as JPEG")
+    b64 = base64.b64encode(buf.tobytes()).decode("ascii")
+    return f"data:image/jpeg;base64,{b64}"
+
+
+class TripletData:
+    """Mixing stacks, on-disk statistics and Auto-Balance presets for one (R, G, B) wavelength triplet."""
+
+    def __init__(self, triplet: tuple[str, str, str], channel_views: dict[str, dict[str, np.ndarray]], jp2_files: list[str]):
+        self.triplet = triplet
         self.jp2_files = jp2_files
-        raw_channels = [visualization.load_jp2(f).astype(np.float32) / 255.0 for f in jp2_files]
-        self.full_stack = np.stack(raw_channels, axis=-1)
-        h, w, _ = self.full_stack.shape
-
         self.views: dict[str, np.ndarray] = {
-            "full_1024": cv2.resize(self.full_stack, (1024, 1024), interpolation=cv2.INTER_AREA),
-            "full_1536": cv2.resize(self.full_stack, (1536, 1536), interpolation=cv2.INTER_AREA),
-            "crop_bottom_half": cv2.resize(
-                self.full_stack[1935 : min(h, 1935 + 2160), 128 : min(w, 128 + 3840), :],
-                (1280, 720),
-                interpolation=cv2.INTER_AREA,
-            ),
-            "zoom_prominence": self.full_stack[2300:3324, 200:1224, :].copy(),
-            "zoom_active_region": self.full_stack[1050:2074, 2800:3824, :].copy(),
+            view_name: np.stack([channel_views[w][view_name] for w in triplet], axis=-1) for view_name in VIEW_NAMES
         }
 
-        preview = self.views["full_1024"].astype(np.float64)
-        mask = np.max(preview, axis=-1) > 0.05
-        self.disk_pixels = preview[mask]
-        self.channel_means = np.mean(self.disk_pixels, axis=0)
-        self.channel_stds = np.std(self.disk_pixels, axis=0)
+        self._preview = self.views["full_1024"].astype(np.float64)
+        self._mask = np.max(self._preview, axis=-1) > 0.05
+        self.disk_pixels = self._preview[self._mask]
         # Small fixed subsample for per-callback diagnostics (dominant hue, cast, clipping).
         stride = max(1, len(self.disk_pixels) // 40000)
         self.sample_pixels = self.disk_pixels[::stride].copy()
         # Even smaller subsample for the 26 renders behind the Global Hue colorbar.
         self.track_pixels = self.sample_pixels[::4].copy()
-        # Per-channel spatial gradients at the same pixels (Gray-Edge statistic). Gradients are linear,
-        # so the gradient of any mixed output channel is simply rgbmix @ (gx, gy).
-        # Standard Gray-Edge pre-smoothing (sigma=2 px) suppresses pixel noise in the gradients.
-        smooth = cv2.GaussianBlur(preview, (0, 0), 2.0)
-        self.disk_grad_x = np.stack([cv2.Sobel(smooth[:, :, k], cv2.CV_64F, 1, 0, ksize=3)[mask] for k in range(3)], axis=-1)
-        self.disk_grad_y = np.stack([cv2.Sobel(smooth[:, :, k], cv2.CV_64F, 0, 1, ksize=3)[mask] for k in range(3)], axis=-1)
-        self.presets = compute_auto_balance_presets(self.disk_pixels, self.disk_grad_x, self.disk_grad_y)
+        self._tone_views: dict[tuple, np.ndarray] = {}
+        self._presets: dict[tuple, dict[str, dict]] = {}
+        self._mids: dict[tuple, np.ndarray] = {}
+        self.presets = self.presets_for(1.0, 0.0)
 
-        self.default_uris: dict[str, str] = {
-            view_name: self.render_uri(view_name, DEFAULT_JP2_RGBMIX)
-            for view_name in self.views
-        }
+    def contrast_mid(self, gamma: float, contrast: float) -> np.ndarray:
+        """Per-channel pivots of the sigmoidal contrast, chosen so each channel's on-disk mean level
+        is unchanged (visualization.mean_preserving_midpoint). The mix being linear, contrast then
+        changes neither the mean brightness nor the color balance, whatever the Option 1/2 sliders.
+        (A single shared pivot shifted each channel's level differently, so the brightness and
+        color change depended on the mixing weights.)"""
+        key = (round(gamma, 3), round(contrast, 2))
+        if key not in self._mids:
+            x = self.sample_pixels ** (1.0 / key[0])
+            self._mids[key] = np.array([visualization.mean_preserving_midpoint(x[:, k], key[1]) for k in range(3)])
+        return self._mids[key]
+
+    def tone(self, x: np.ndarray, gamma: float, contrast: float) -> np.ndarray:
+        """Input tone curve: gamma x**(1/gamma), then per-channel sigmoidal contrast (= visualization.scale_rgb)."""
+        if abs(gamma - 1.0) > 1e-6:
+            x = np.power(x, x.dtype.type(1.0 / gamma))
+        if contrast <= 1e-6:
+            return x
+        mids = self.contrast_mid(gamma, contrast)
+        return np.stack([visualization.sigmoid_contrast(x[..., k], contrast, mids[k]) for k in range(3)], axis=-1)
+
+    def tone_view(self, view_name: str, gamma: float, contrast: float) -> np.ndarray:
+        """Tone-mapped input stack for a view. Only the most recent ones are kept, so hue/chroma
+        drags reuse them."""
+        if abs(gamma - 1.0) < 1e-6 and contrast <= 1e-6:
+            return self.views[view_name]
+        key = (view_name, round(gamma, 3), round(contrast, 2))
+        if key not in self._tone_views:
+            if len(self._tone_views) >= 2:
+                self._tone_views.pop(next(iter(self._tone_views)))
+            self._tone_views[key] = self.tone(self.views[view_name], gamma, contrast)
+        return self._tone_views[key]
+
+    def tone_pixels(self, gamma: float, contrast: float) -> tuple[np.ndarray, np.ndarray]:
+        """(sample, track) pixel subsamples after the tone curve, for diagnostics and the Global Hue colorbar."""
+        return self.tone(self.sample_pixels, gamma, contrast), self.tone(self.track_pixels, gamma, contrast)
+
+    def presets_for(self, gamma: float, contrast: float) -> dict[str, dict]:
+        """Auto-Balance presets computed on the tone-mapped inputs actually being mixed (cached)."""
+        key = (round(gamma, 2), round(contrast, 1))
+        if key not in self._presets:
+            preview = self.tone(self._preview, *key)
+            self._presets[key] = compute_auto_balance_presets(preview[self._mask])
+        return self._presets[key]
 
     def render_uri(
         self,
         view_name: str,
         rgbmix: np.ndarray,
+        gamma: float = 1.0,
+        contrast: float = 0.0,
         scalemin: float = 0.0,
         jpeg_quality: int = 92,
     ) -> str:
-        """Apply 3x3 rgbmix to cached float32 stack and return a base64 JPEG data URI."""
-        stack = self.views[view_name]
-        mixed = stack @ rgbmix.astype(np.float32).T
+        """Apply the input tone curve and the 3x3 rgbmix to the cached float32 stack; return a JPEG data URI."""
+        mixed = self.tone_view(view_name, gamma, contrast) @ rgbmix.astype(np.float32).T
         np.clip(mixed, 0.0, 1.0, out=mixed)
         mixed *= 255.0
         if scalemin > 0:
             mixed = (mixed - scalemin) * (255.0 / (255.0 - scalemin))
             np.clip(mixed, 0.0, 255.0, out=mixed)
+        return _encode_uri(mixed[:, :, ::-1].astype(np.uint8), jpeg_quality)
 
-        bgr_u8 = mixed[:, :, ::-1].astype(np.uint8)
-        ok, buf = cv2.imencode(".jpg", bgr_u8, [int(cv2.IMWRITE_JPEG_QUALITY), jpeg_quality])
-        if not ok:
-            raise RuntimeError("Failed to encode preview image as JPEG")
-        b64 = base64.b64encode(buf.tobytes()).decode("ascii")
-        return f"data:image/jpeg;base64,{b64}"
+
+class JP2ImageCache:
+    """
+    Pre-loads every available 4096x4096 JP2 wavelength once as small preview views, plus each
+    wavelength rendered alone in its sunpy SDO/AIA colormap. Mixing stacks, statistics and presets
+    for a selected (R, G, B) triplet are built on demand and kept for the most recent triplets.
+    """
+
+    MAX_TRIPLETS = 4
+
+    def __init__(self, jp2_by_wavel: dict[str, str]):
+        self.jp2_by_wavel = jp2_by_wavel
+        self.wavelengths = list(jp2_by_wavel)
+        self.channel_views: dict[str, dict[str, np.ndarray]] = {}
+        self.channel_uris: dict[str, dict[str, str]] = {}
+        for wavel, path in jp2_by_wavel.items():
+            full = visualization.load_jp2(path).astype(np.float32) / 255.0
+            self.channel_views[wavel] = _make_views(full)
+            lut = sunpy_lut_bgr_u8(aia_cmap_name(wavel))
+            self.channel_uris[wavel] = {
+                view_name: _encode_uri(lut[np.round(np.clip(v, 0.0, 1.0) * 255.0).astype(np.uint8)])
+                for view_name, v in self.channel_views[wavel].items()
+            }
+        self._triplets: dict[tuple[str, str, str], TripletData] = {}
+
+    def get(self, triplet) -> TripletData:
+        triplet = tuple(str(w) for w in triplet)
+        if triplet not in self._triplets:
+            if len(self._triplets) >= self.MAX_TRIPLETS:
+                self._triplets.pop(next(iter(self._triplets)))
+            files = [self.jp2_by_wavel[w] for w in triplet]
+            self._triplets[triplet] = TripletData(triplet, self.channel_views, files)
+        return self._triplets[triplet]
+
+
+def gamma_track_gradient(n_stops: int = 16, faint: float = 0.2) -> str:
+    """Gamma track: brightness a faint input (x = 0.2) takes at each gamma, so the bar shows the lift."""
+    stops = []
+    for g in np.linspace(GAMMA_MIN, GAMMA_MAX, n_stops):
+        v = int(round(255.0 * faint ** (1.0 / g)))
+        stops.append(f"rgb({v}, {v}, {v})")
+    return f"linear-gradient(to right, {', '.join(stops)})"
+
+
+def contrast_track_gradient(n_stops: int = 16) -> str:
+    """Contrast track: a gray ramp passed through the sigmoid at mid strength, so the bar shows
+    how mid-tones get stretched while black and white stay put."""
+    x = np.linspace(0.0, 1.0, n_stops)
+    y = visualization.sigmoid_contrast(x, 0.5 * CONTRAST_MAX, 0.5)
+    return f"linear-gradient(to right, {', '.join(f'rgb({int(round(v * 255))}, {int(round(v * 255))}, {int(round(v * 255))})' for v in y)})"
 
 
 def _format_dark_marks(marks: dict) -> dict:
@@ -640,7 +791,7 @@ def _slider_row(
             html.Div(
                 style={"display": "flex", "justifyContent": "space-between", "marginBottom": "2px"},
                 children=[
-                    html.Span(label, style={"fontSize": "13px", "fontWeight": "600", "color": "#e2e8f0"}),
+                    html.Span(label, id=f"{slider_id}-label", style={"fontSize": "13px", "fontWeight": "600", "color": "#e2e8f0"}),
                     html.Span(
                         id=f"{slider_id}-val",
                         style={"fontSize": "12px", "fontFamily": "monospace", "fontWeight": "600", "color": "#38bdf8"},
@@ -692,6 +843,19 @@ def _wheel_pin_style(H_deg: float, C: float, swatch_color: str) -> dict:
         "pointerEvents": "none",
         "whiteSpace": "nowrap",
     }
+
+
+def _display_grid_style(compare_mode: str) -> dict:
+    """Side-by-side gives the mix 3x the width of the stacked channel column, so the three
+    stacked channel images add up to the same height as the mixed image."""
+    cols = "3fr 1fr" if compare_mode == "side_by_side" else "1fr"
+    return {"display": "grid", "gridTemplateColumns": cols, "gap": "16px", "alignItems": "start"}
+
+
+def _channels_stack_style(compare_mode: str) -> dict:
+    """Stack the 3 channels vertically next to the mix, or in a row when shown alone."""
+    cols = "1fr" if compare_mode == "side_by_side" else "1fr 1fr 1fr"
+    return {"display": "grid", "gridTemplateColumns": cols, "gap": "8px"}
 
 
 DARK_THEME_INDEX_STRING = """<!DOCTYPE html>
@@ -764,6 +928,15 @@ DARK_THEME_INDEX_STRING = """<!DOCTYPE html>
                 color: #e2e8f0 !important;
                 border-color: #475569 !important;
             }
+            /* Invisible focus helper of dcc.Dropdown: keep it from overflowing narrow dropdowns
+               (the per-channel wavelength selectors) and creating a horizontal page scroll. */
+            .dash-dropdown-focus-target {
+                width: 1px !important;
+                left: 0 !important;
+            }
+            .eye-btn:hover {
+                border-color: #38bdf8 !important;
+            }
             .dash-dropdown-option:hover {
                 background-color: #334155 !important;
                 color: #ffffff !important;
@@ -794,7 +967,9 @@ def create_dash_app(cache: JP2ImageCache, output_dir: str) -> Dash:
     app = Dash(__name__, title="AIA-Reloaded Interactive RGB / LCh Mixer")
     app.index_string = DARK_THEME_INDEX_STRING
 
-    init_gh_grad, base_dom_h = global_hue_track(DEFAULT_WB_LCH, cache.track_pixels, 0.0)
+    init_triplet = default_triplet(cache.wavelengths)
+    init_data = cache.get(init_triplet)
+    init_gh_grad, base_dom_h = global_hue_track(DEFAULT_WB_LCH, init_data.track_pixels, 0.0)
     _, init_gc_grad, init_gl_grad, init_g_swatch = make_triplet_gradients_and_swatch(
         0.0, GLOBAL_H_MIN, GLOBAL_H_MAX,
         1.0, GLOBAL_C_MIN, GLOBAL_C_MAX, 1.0,
@@ -804,9 +979,8 @@ def create_dash_app(cache: JP2ImageCache, output_dir: str) -> Dash:
     init_gh_hue_color = _rgb_vec_to_css(vivid_rgb_at_hue(base_dom_h))
 
     waveband_meta = [
-        {"idx": 0, "wavel": "304 Å", "short": "304", "role": "Red Input — Chromosphere & Prominences"},
-        {"idx": 1, "wavel": "171 Å", "short": "171", "role": "Green Input — Quiet Corona & Coronal Loops"},
-        {"idx": 2, "wavel": "193 Å", "short": "193", "role": "Blue Input — Hot Corona & Flare Loops"},
+        {"idx": k, "wavel": f"{w} Å", "short": w, "role": waveband_role(k, w)}
+        for k, w in enumerate(init_triplet)
     ]
 
     wb_cards = []
@@ -835,8 +1009,8 @@ def create_dash_app(cache: JP2ImageCache, output_dir: str) -> Dash:
                         children=[
                             html.Div(
                                 children=[
-                                    html.Span(wb["wavel"], style={"fontWeight": "700", "fontSize": "14px", "color": "#f8fafc"}),
-                                    html.Span(f"  ({wb['role']})", style={"fontSize": "11px", "color": "#cbd5e1"}),
+                                    html.Span(wb["wavel"], id=f"wb-{i}-title", style={"fontWeight": "700", "fontSize": "14px", "color": "#f8fafc"}),
+                                    html.Span(f"  ({wb['role']})", id=f"wb-{i}-role", style={"fontSize": "11px", "color": "#cbd5e1"}),
                                 ]
                             ),
                             html.Div(
@@ -938,7 +1112,7 @@ def create_dash_app(cache: JP2ImageCache, output_dir: str) -> Dash:
                                 style={"margin": "0", "fontSize": "20px", "fontWeight": "700", "color": "#f8fafc"},
                             ),
                             html.Div(
-                                f"Loaded samples: {', '.join(os.path.basename(f) for f in cache.jp2_files)}",
+                                f"Loaded samples: {', '.join(os.path.basename(f) for f in cache.jp2_by_wavel.values())}",
                                 style={"fontSize": "12px", "color": "#cbd5e1", "marginTop": "2px"},
                             ),
                         ]
@@ -998,70 +1172,59 @@ def create_dash_app(cache: JP2ImageCache, output_dir: str) -> Dash:
                                 },
                                 children=[
                                     html.Div(
-                                        "Auto-Balance Rules (Data-Driven & Color Harmony)",
+                                        "Auto-Balance Rules & Presets",
                                         style={"fontWeight": "700", "fontSize": "14px", "color": "#a7f3d0", "marginBottom": "6px"},
                                     ),
                                     html.Div(
-                                        "Click any rule to auto-compute optimal (H, C, L) from the JP2 image statistics and update all Option 1 & Option 2 sliders:",
+                                        "Apply a rule computed from the image statistics, or save / load your Option 1 & Option 2 settings as a .json preset (in presets/):",
                                         style={"fontSize": "11px", "color": "#cbd5e1", "marginBottom": "10px"},
                                     ),
                                     html.Div(
-                                        style={"display": "grid", "gridTemplateColumns": "1fr 1fr", "gap": "8px", "marginBottom": "10px"},
+                                        style={"display": "grid", "gridTemplateColumns": "1fr 1fr", "gap": "8px", "marginBottom": "8px"},
                                         children=[
                                             html.Button(
-                                                cache.presets["gray_world"]["label"],
-                                                id="btn-auto-gray-world",
-                                                className="preset-btn",
-                                                n_clicks=0,
-                                                style=preset_btn_style,
-                                            ),
-                                            html.Button(
-                                                cache.presets["warm_cool"]["label"],
+                                                init_data.presets["warm_cool"]["label"],
                                                 id="btn-auto-warm-cool",
                                                 className="preset-btn",
                                                 n_clicks=0,
                                                 style=preset_btn_style,
                                             ),
                                             html.Button(
-                                                cache.presets["equal_salience"]["label"],
-                                                id="btn-auto-equal-salience",
-                                                className="preset-btn",
-                                                n_clicks=0,
-                                                style=preset_btn_style,
-                                            ),
-                                            html.Button(
-                                                cache.presets["triadic_120"]["label"],
-                                                id="btn-auto-triadic",
-                                                className="preset-btn",
-                                                n_clicks=0,
-                                                style=preset_btn_style,
-                                            ),
-                                            html.Button(
-                                                cache.presets["white_patch"]["label"],
+                                                init_data.presets["white_patch"]["label"],
                                                 id="btn-auto-white-patch",
                                                 className="preset-btn",
                                                 n_clicks=0,
                                                 style=preset_btn_style,
                                             ),
                                             html.Button(
-                                                cache.presets["gray_edge"]["label"],
-                                                id="btn-auto-gray-edge",
+                                                "💾 Save Preset…",
+                                                id="btn-save-preset",
                                                 className="preset-btn",
                                                 n_clicks=0,
+                                                title="Save the Option 1 & Option 2 sliders to presets/<name>.json",
                                                 style=preset_btn_style,
                                             ),
-                                            html.Button(
-                                                cache.presets["decorrelation"]["label"],
-                                                id="btn-auto-decorrelation",
-                                                className="preset-btn",
-                                                n_clicks=0,
-                                                style=preset_btn_style,
+                                            dcc.Upload(
+                                                id="preset-upload",
+                                                accept=".json,application/json",
+                                                multiple=False,
+                                                children=html.Button(
+                                                    "📂 Load Preset…",
+                                                    className="preset-btn",
+                                                    title="Load Option 1 & Option 2 sliders from a .json preset (e.g. in presets/)",
+                                                    style={**preset_btn_style, "width": "100%"},
+                                                ),
                                             ),
                                         ],
                                     ),
+                                    dcc.Store(id="preset-save-request"),
+                                    html.Div(
+                                        id="preset-status",
+                                        style={"fontSize": "11px", "color": "#38bdf8", "marginBottom": "8px", "minHeight": "14px"},
+                                    ),
                                     html.Div(
                                         id="auto-balance-desc",
-                                        children=cache.presets["default"]["desc"],
+                                        children=init_data.presets["default"]["desc"],
                                         style={
                                             "backgroundColor": "#0f172a",
                                             "border": "1px solid #334155",
@@ -1162,7 +1325,7 @@ def create_dash_app(cache: JP2ImageCache, output_dir: str) -> Dash:
                                                         }
                                                     ),
                                                     html.Div(
-                                                        "304",
+                                                        init_triplet[0],
                                                         id="wheel-pin-0",
                                                         style=_wheel_pin_style(
                                                             init_anchor[0]["H"],
@@ -1171,7 +1334,7 @@ def create_dash_app(cache: JP2ImageCache, output_dir: str) -> Dash:
                                                         ),
                                                     ),
                                                     html.Div(
-                                                        "171",
+                                                        init_triplet[1],
                                                         id="wheel-pin-1",
                                                         style=_wheel_pin_style(
                                                             init_anchor[1]["H"],
@@ -1180,7 +1343,7 @@ def create_dash_app(cache: JP2ImageCache, output_dir: str) -> Dash:
                                                         ),
                                                     ),
                                                     html.Div(
-                                                        "193",
+                                                        init_triplet[2],
                                                         id="wheel-pin-2",
                                                         style=_wheel_pin_style(
                                                             init_anchor[2]["H"],
@@ -1355,18 +1518,18 @@ def create_dash_app(cache: JP2ImageCache, output_dir: str) -> Dash:
                                     html.Div(
                                         style={"display": "flex", "alignItems": "center", "gap": "10px"},
                                         children=[
-                                            html.Span("Comparison Mode:", style={"fontSize": "13px", "fontWeight": "600", "color": "#e2e8f0"}),
-                                            dcc.RadioItems(
+                                            html.Span("Comparison:", style={"fontSize": "13px", "fontWeight": "600", "color": "#e2e8f0"}),
+                                            dcc.Dropdown(
                                                 id="compare-mode",
                                                 options=[
-                                                    {"label": " Side-by-Side (Modified vs. Default)", "value": "side_by_side"},
-                                                    {"label": " Single Large View (Modified)", "value": "single"},
-                                                    {"label": " Hold Default Only", "value": "default_only"},
+                                                    {"label": "Side-by-Side (Mix + Input Channels)", "value": "side_by_side"},
+                                                    {"label": "Single Large View (Mix)", "value": "single"},
+                                                    {"label": "Input Channels Only", "value": "channels_only"},
                                                 ],
                                                 value="side_by_side",
-                                                inline=True,
-                                                style={"fontSize": "13px", "display": "flex", "gap": "12px", "color": "#e2e8f0"},
-                                                labelStyle={"color": "#e2e8f0", "marginRight": "8px"},
+                                                clearable=False,
+                                                searchable=False,
+                                                style={"width": "250px", "fontSize": "13px", "color": "#e2e8f0"},
                                             ),
                                         ],
                                     ),
@@ -1379,30 +1542,76 @@ def create_dash_app(cache: JP2ImageCache, output_dir: str) -> Dash:
                             # Image Display Container
                             html.Div(
                                 id="image-display-grid",
-                                style={"display": "grid", "gridTemplateColumns": "1fr 1fr", "gap": "16px"},
+                                style=_display_grid_style("side_by_side"),
                                 children=[
-                                    # Modified Image Card
+                                    # Mix column: the mixed image with its Tone Curve panel right below it, so the
+                                    # panel spans the mix only (not the input-channels column).
                                     html.Div(
-                                        id="modified-card",
-                                        style={
-                                            "backgroundColor": "#090d16",
-                                            "border": "1px solid #38bdf8",
-                                            "borderRadius": "8px",
-                                            "padding": "10px",
-                                            "textAlign": "center",
-                                        },
+                                        id="modified-column",
                                         children=[
+                                            # Modified Image Card
                                             html.Div(
-                                                "Modified Mix (Live LCh -> self.rgbmix)",
-                                                style={"fontSize": "13px", "fontWeight": "700", "color": "#38bdf8", "marginBottom": "8px"},
+                                                id="modified-card",
+                                                style={
+                                                    "backgroundColor": "#090d16",
+                                                    "border": "1px solid #38bdf8",
+                                                    "borderRadius": "8px",
+                                                    "padding": "10px",
+                                                    "textAlign": "center",
+                                                },
+                                                children=[
+                                                    html.Div(
+                                                        "Modified Mix (Live LCh -> self.rgbmix)",
+                                                        style={"fontSize": "13px", "fontWeight": "700", "color": "#38bdf8", "marginBottom": "8px"},
+                                                    ),
+                                                    html.Img(
+                                                        id="img-modified",
+                                                        style={"width": "100%", "maxHeight": "78vh", "objectFit": "contain", "borderRadius": "4px"},
+                                                    ),
+                                                ],
                                             ),
-                                            html.Img(
-                                                id="img-modified",
-                                                style={"width": "100%", "maxHeight": "78vh", "objectFit": "contain", "borderRadius": "4px"},
+                                            # Tone panel (spans the mix column only): input gamma, then sigmoidal
+                                            # contrast to restore the mid-tone contrast that gamma flattens.
+                                            html.Div(
+                                                style={
+                                                    "backgroundColor": "#1e293b",
+                                                    "border": "1px solid #334155",
+                                                    "borderRadius": "8px",
+                                                    "padding": "12px 16px 4px 16px",
+                                                    "marginTop": "14px",
+                                                },
+                                                children=[
+                                                    html.Div(
+                                                        "Tone Curve (applied to each input channel before mixing)",
+                                                        style={"fontWeight": "700", "fontSize": "14px", "color": "#f8fafc", "marginBottom": "8px"},
+                                                    ),
+                                                    _slider_row(
+                                                        "Gamma γ — lift faint structures (x → x^(1/γ))",
+                                                        "gamma",
+                                                        GAMMA_MIN,
+                                                        GAMMA_MAX,
+                                                        0.05,
+                                                        1.0,
+                                                        {0.5: "0.5", 1.0: "1.0", 1.5: "1.5", 2.0: "2.0", 2.5: "2.5", 3.0: "3.0"},
+                                                        gamma_track_gradient(),
+                                                        "#cbd5e1",
+                                                    ),
+                                                    _slider_row(
+                                                        "Contrast — sigmoidal S-curve, brightness-neutral per channel (0 = off)",
+                                                        "contrast",
+                                                        CONTRAST_MIN,
+                                                        CONTRAST_MAX,
+                                                        0.1,
+                                                        0.0,
+                                                        {0: "0", 3: "3", 6: "6", 9: "9", 12: "12"},
+                                                        contrast_track_gradient(),
+                                                        "#cbd5e1",
+                                                    ),
+                                                ],
                                             ),
                                         ],
                                     ),
-                                    # Default Reference Card
+                                    # Input Channels Card: 304 / 171 / 193 each in its sunpy SDO/AIA colormap
                                     html.Div(
                                         id="default-card",
                                         style={
@@ -1414,12 +1623,82 @@ def create_dash_app(cache: JP2ImageCache, output_dir: str) -> Dash:
                                         },
                                         children=[
                                             html.Div(
-                                                "Default set_jp2_default() Reference",
+                                                "Input Channels (sunpy SDO/AIA colormaps)",
                                                 style={"fontSize": "13px", "fontWeight": "600", "color": "#cbd5e1", "marginBottom": "8px"},
                                             ),
-                                            html.Img(
-                                                id="img-default",
-                                                style={"width": "100%", "maxHeight": "78vh", "objectFit": "contain", "borderRadius": "4px"},
+                                            html.Div(
+                                                id="channels-stack",
+                                                style=_channels_stack_style("side_by_side"),
+                                                children=[
+                                                    html.Figure(
+                                                        style={"margin": "0"},
+                                                        children=[
+                                                            html.Div(
+                                                                style={"display": "flex", "alignItems": "center", "gap": "6px", "marginBottom": "4px"},
+                                                                children=[
+                                                                    html.Span(
+                                                                        slot["rgb"],
+                                                                        title=f"{slot['name']} output channel (rgbmix column {k})",
+                                                                        style={
+                                                                            "fontWeight": "800",
+                                                                            "fontSize": "12px",
+                                                                            "color": "#0f172a",
+                                                                            "backgroundColor": slot["color"],
+                                                                            "borderRadius": "4px",
+                                                                            "padding": "2px 6px",
+                                                                        },
+                                                                    ),
+                                                                    dcc.Dropdown(
+                                                                        id=f"ch-select-{k}",
+                                                                        options=[{"label": f"{w} Å", "value": w} for w in cache.wavelengths],
+                                                                        value=init_triplet[k],
+                                                                        clearable=False,
+                                                                        searchable=False,
+                                                                        style={"flex": "1", "minWidth": "0", "fontSize": "12px", "color": "#e2e8f0"},
+                                                                    ),
+                                                                ],
+                                                            ),
+                                                            # Thumbnail with the eye toggle overlaid on its top-right corner.
+                                                            html.Div(
+                                                                style={"position": "relative"},
+                                                                children=[
+                                                                    html.Img(
+                                                                        id=f"img-channel-{k}",
+                                                                        src=cache.channel_uris[init_triplet[k]]["full_1024"],
+                                                                        style={"width": "100%", "objectFit": "contain", "borderRadius": "4px", "display": "block"},
+                                                                    ),
+                                                                    html.Button(
+                                                                        html.Img(
+                                                                            id=f"ch-eye-icon-{k}",
+                                                                            src=EYE_OPEN_URI,
+                                                                            style={"width": "18px", "height": "18px", "display": "block"},
+                                                                        ),
+                                                                        id=f"ch-eye-{k}",
+                                                                        n_clicks=0,
+                                                                        title="Hide this channel from the mix (preview only; sliders unchanged)",
+                                                                        className="eye-btn",
+                                                                        style={
+                                                                            "position": "absolute",
+                                                                            "top": "4px",
+                                                                            "right": "4px",
+                                                                            "backgroundColor": "rgba(15, 23, 42, 0.75)",
+                                                                            "border": "1px solid #475569",
+                                                                            "borderRadius": "6px",
+                                                                            "padding": "3px 4px",
+                                                                            "cursor": "pointer",
+                                                                        },
+                                                                    ),
+                                                                ],
+                                                            ),
+                                                            html.Figcaption(
+                                                                channel_caption(k, init_triplet[k]),
+                                                                id=f"ch-caption-{k}",
+                                                                style={"fontSize": "11px", "color": "#cbd5e1", "marginTop": "3px"},
+                                                            ),
+                                                        ],
+                                                    )
+                                                    for k, slot in enumerate(RGB_SLOTS)
+                                                ],
                                             ),
                                         ],
                                     ),
@@ -1451,13 +1730,15 @@ def create_dash_app(cache: JP2ImageCache, output_dir: str) -> Dash:
         Output("global-c", "value"),
         Output("global-l", "value"),
         Output("img-modified", "src"),
-        Output("img-default", "src"),
+        Output("channels-stack", "style"),
         Output("image-display-grid", "style"),
-        Output("modified-card", "style"),
+        Output("modified-column", "style"),
         Output("default-card", "style"),
         Output("rgbmix-code", "children"),
         Output("balance-metrics", "children"),
         Output("render-timing", "children"),
+        Output("gamma-val", "children"),
+        Output("contrast-val", "children"),
         Output("auto-balance-desc", "children"),
         Output("global-h-val", "children"),
         Output("global-c-val", "children"),
@@ -1491,6 +1772,7 @@ def create_dash_app(cache: JP2ImageCache, output_dir: str) -> Dash:
         Output("wb-2-c-wrap", "style"),
         Output("wb-2-l-wrap", "style"),
         Output("mixer-state-store", "data"),
+        Output("preset-upload", "contents"),
         Input("global-h", "value"),
         Input("global-c", "value"),
         Input("global-l", "value"),
@@ -1505,16 +1787,21 @@ def create_dash_app(cache: JP2ImageCache, output_dir: str) -> Dash:
         Input("wb-2-l", "value"),
         Input("btn-reset", "n_clicks"),
         Input("btn-reset-global", "n_clicks"),
-        Input("btn-auto-gray-world", "n_clicks"),
         Input("btn-auto-warm-cool", "n_clicks"),
-        Input("btn-auto-equal-salience", "n_clicks"),
-        Input("btn-auto-triadic", "n_clicks"),
         Input("btn-auto-white-patch", "n_clicks"),
-        Input("btn-auto-gray-edge", "n_clicks"),
-        Input("btn-auto-decorrelation", "n_clicks"),
+        Input("preset-upload", "contents"),
         Input("view-select", "value"),
         Input("compare-mode", "value"),
+        Input("ch-select-0", "value"),
+        Input("ch-select-1", "value"),
+        Input("ch-select-2", "value"),
+        Input("gamma", "value"),
+        Input("contrast", "value"),
+        Input("ch-eye-0", "n_clicks"),
+        Input("ch-eye-1", "n_clicks"),
+        Input("ch-eye-2", "n_clicks"),
         State("mixer-state-store", "data"),
+        State("preset-upload", "filename"),
     )
     def master_update(
         gh,
@@ -1531,19 +1818,28 @@ def create_dash_app(cache: JP2ImageCache, output_dir: str) -> Dash:
         w2l,
         _n_reset,
         _n_reset_global,
-        _n_gw,
         _n_wc,
-        _n_es,
-        _n_tr,
         _n_wp,
-        _n_ge,
-        _n_dcs,
+        upload_contents,
         view_name,
         compare_mode,
+        ch0,
+        ch1,
+        ch2,
+        gamma,
+        contrast,
+        eye0,
+        eye1,
+        eye2,
         store_data,
+        upload_filename,
     ):
         t0 = time.perf_counter()
         trigger = ctx.triggered_id
+        data = cache.get((ch0, ch1, ch2))
+        gamma = float(gamma) if gamma else 1.0
+        contrast = float(contrast) if contrast else 0.0
+        sample_px, track_px = data.tone_pixels(gamma, contrast)
 
         anchor_wb = copy.deepcopy(store_data["anchor_wb"])
         last_synced_wb = copy.deepcopy(store_data["last_synced_wb"])
@@ -1555,25 +1851,38 @@ def create_dash_app(cache: JP2ImageCache, output_dir: str) -> Dash:
         ]
 
         if isinstance(trigger, str) and trigger.startswith("wb-") and current_wb_inputs == last_synced_wb:
-            return (no_update,) * 53
+            return (no_update,) * len(ctx.outputs_list)
 
         preset_map = {
             "btn-reset": "default",
-            "btn-auto-gray-world": "gray_world",
             "btn-auto-warm-cool": "warm_cool",
-            "btn-auto-equal-salience": "equal_salience",
-            "btn-auto-triadic": "triadic_120",
             "btn-auto-white-patch": "white_patch",
-            "btn-auto-gray-edge": "gray_edge",
-            "btn-auto-decorrelation": "decorrelation",
         }
 
-        desc_out = no_update
+        # A new wavelength assignment changes the statistics behind the default description.
+        desc_out = data.presets_for(gamma, contrast)["default"]["desc"] if trigger in {"ch-select-0", "ch-select-1", "ch-select-2"} else no_update
         update_wb_sliders = False
         update_global_sliders = False
+        clear_upload = no_update
 
-        if trigger in preset_map:
-            preset = cache.presets[preset_map[trigger]]
+        loaded = None
+        if trigger == "preset-upload" and upload_contents:
+            clear_upload = None  # so loading the same file again re-triggers
+            try:
+                _, b64 = upload_contents.split(",", 1)
+                loaded = parse_preset(json.loads(base64.b64decode(b64).decode("utf-8")))
+            except (ValueError, KeyError, TypeError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+                desc_out = f"Could not load preset '{upload_filename}': {exc}"
+
+        if loaded is not None:
+            anchor_wb, (gh, gc, gl) = loaded
+            wb_lch = apply_global_to_anchor(anchor_wb, gh, gc, gl)
+            last_synced_wb = copy.deepcopy(wb_lch)
+            update_wb_sliders = True
+            update_global_sliders = True
+            desc_out = f"Loaded preset '{upload_filename}' (Option 1 & Option 2 sliders)."
+        elif trigger in preset_map:
+            preset = data.presets_for(gamma, contrast)[preset_map[trigger]]
             anchor_wb = apply_global_to_anchor(preset["wb_lch"], 0.0, 1.0, 1.0)
             wb_lch = copy.deepcopy(anchor_wb)
             last_synced_wb = copy.deepcopy(wb_lch)
@@ -1605,17 +1914,14 @@ def create_dash_app(cache: JP2ImageCache, output_dir: str) -> Dash:
             wb_lch = current_wb_inputs
 
         rgbmix = lch_to_rgbmix(wb_lch)
-        mod_uri = cache.render_uri(view_name, rgbmix)
-        def_uri = cache.default_uris[view_name]
+        # Hidden channels are dropped from what is displayed only (their rgbmix column is zeroed);
+        # sliders, anchors and the exported matrix are left untouched, so un-hiding restores the mix.
+        visible = visibility_mask(eye0, eye1, eye2)
+        shown_mix = rgbmix * visible
+        mod_uri = data.render_uri(view_name, shown_mix, gamma, contrast)
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
 
-        base_mod_style = {
-            "backgroundColor": "#090d16",
-            "border": "1px solid #38bdf8",
-            "borderRadius": "8px",
-            "padding": "10px",
-            "textAlign": "center",
-        }
+        base_mod_style = {}
         base_def_style = {
             "backgroundColor": "#090d16",
             "border": "1px solid #334155",
@@ -1624,24 +1930,27 @@ def create_dash_app(cache: JP2ImageCache, output_dir: str) -> Dash:
             "textAlign": "center",
         }
 
-        if compare_mode == "side_by_side":
-            grid_style = {"display": "grid", "gridTemplateColumns": "1fr 1fr", "gap": "16px"}
-        elif compare_mode == "single":
-            grid_style = {"display": "grid", "gridTemplateColumns": "1fr", "gap": "16px"}
+        grid_style = _display_grid_style(compare_mode)
+        if compare_mode == "single":
             base_def_style = {**base_def_style, "display": "none"}
-        else:
-            grid_style = {"display": "grid", "gridTemplateColumns": "1fr", "gap": "16px"}
-            base_mod_style = {**base_mod_style, "display": "none"}
+        elif compare_mode == "channels_only":
+            base_mod_style = {"display": "none"}
 
         code_str = (
             "self.rgbmix = np.array([\n"
             f"    [{rgbmix[0, 0]:7.4f}, {rgbmix[0, 1]:7.4f}, {rgbmix[0, 2]:7.4f}],\n"
             f"    [{rgbmix[1, 0]:7.4f}, {rgbmix[1, 1]:7.4f}, {rgbmix[1, 2]:7.4f}],\n"
             f"    [{rgbmix[2, 0]:7.4f}, {rgbmix[2, 1]:7.4f}, {rgbmix[2, 2]:7.4f}],\n"
-            "])"
+            "])\n"
+            f"self.gamma_rgb = ({gamma:.2f}, {gamma:.2f}, {gamma:.2f})\n"
+            f"self.contrast = {contrast:.1f}\n"
+            f"self.contrast_mid = ({', '.join(f'{v:.4f}' for v in data.contrast_mid(gamma, contrast))})"
         )
+        hidden = [f"{w} Å" for w, v in zip((ch0, ch1, ch2), visible) if not v]
+        if hidden:
+            code_str += f"\n# preview currently hides {', '.join(hidden)} (matrix above is the full mix)"
 
-        mets = mix_metrics(rgbmix, cache.sample_pixels)
+        mets = mix_metrics(shown_mix, sample_px)
         p995 = mets["p995"]
         metrics_str = (
             f"Disk Mean Cast (a, b): ({mets['a']:+.3f}, {mets['b']:+.3f})  |  "
@@ -1651,7 +1960,7 @@ def create_dash_app(cache: JP2ImageCache, output_dir: str) -> Dash:
 
         # Option 1 Global Hue track: centred on the dominant hue of the image rendered with the
         # stationary anchor (ΔH = 0), so the color under the cursor is the Sun's resulting hue.
-        grad_gh, sun_h = global_hue_track(anchor_wb, cache.track_pixels, float(gh), float(gc), float(gl))
+        grad_gh, sun_h = global_hue_track(anchor_wb, track_px, float(gh), float(gc), float(gl), visible=visible)
         _, grad_gc, grad_gl, g_swatch = make_triplet_gradients_and_swatch(
             0.0, GLOBAL_H_MIN, GLOBAL_H_MAX,
             float(gc), GLOBAL_C_MIN, GLOBAL_C_MAX, 1.0,
@@ -1698,19 +2007,21 @@ def create_dash_app(cache: JP2ImageCache, output_dir: str) -> Dash:
             if update_wb_sliders
             else (no_update,) * 9
         )
-        global_slider_outs = (0.0, 1.0, 1.0) if update_global_sliders else (no_update,) * 3
+        global_slider_outs = (float(gh), float(gc), float(gl)) if update_global_sliders else (no_update,) * 3
 
         return (
             *wb_slider_outs,
             *global_slider_outs,
             mod_uri,
-            def_uri,
+            _channels_stack_style(compare_mode),
             grid_style,
             base_mod_style,
             base_def_style,
             code_str,
             metrics_str,
             f"Render: {elapsed_ms:.1f} ms",
+            f"{gamma:.2f}",
+            f"{contrast:.1f}" if contrast > 0 else "off",
             desc_out,
             f"{float(gh):+.1f}° → Sun hue {sun_h:.0f}°",
             f"{float(gc):.2f}×",
@@ -1742,7 +2053,135 @@ def create_dash_app(cache: JP2ImageCache, output_dir: str) -> Dash:
             _slider_wrap_style(grad_gl, g_swatch),
             *wb_wraps,
             {"anchor_wb": anchor_wb, "last_synced_wb": last_synced_wb},
+            clear_upload,
         )
+
+    # Channel images and every wavelength label depend only on the view and the wavelength
+    # assignment, so they are sent only when those change (not on every slider drag).
+    channel_outputs = []
+    for k in range(3):
+        channel_outputs += [
+            Output(f"img-channel-{k}", "src"),
+            Output(f"ch-caption-{k}", "children"),
+            Output(f"wheel-pin-{k}", "children"),
+            Output(f"wb-{k}-title", "children"),
+            Output(f"wb-{k}-role", "children"),
+            Output(f"wb-{k}-h-label", "children"),
+            Output(f"wb-{k}-c-label", "children"),
+            Output(f"wb-{k}-l-label", "children"),
+        ]
+
+    @app.callback(
+        *channel_outputs,
+        Input("view-select", "value"),
+        Input("ch-select-0", "value"),
+        Input("ch-select-1", "value"),
+        Input("ch-select-2", "value"),
+        prevent_initial_call=True,
+    )
+    def update_channel_panel(view_name, ch0, ch1, ch2):
+        out = []
+        for k, wavel in enumerate((ch0, ch1, ch2)):
+            out += [
+                cache.channel_uris[wavel][view_name],
+                channel_caption(k, wavel),
+                wavel,
+                f"{wavel} Å",
+                f"  ({waveband_role(k, wavel)})",
+                f"{wavel} Å Hue Angle (H°)",
+                f"{wavel} Å Chroma / Saturation (C)",
+                f"{wavel} Å Luminance Weight (L)",
+            ]
+        return tuple(out)
+
+    # Save Preset: ask for a filename in the browser, then write the JSON server-side into presets/.
+    app.clientside_callback(
+        """
+        function(n) {
+            if (!n) { return window.dash_clientside.no_update; }
+            const d = new Date();
+            const pad = (x) => String(x).padStart(2, "0");
+            const def = "preset_" + d.getFullYear() + pad(d.getMonth() + 1) + pad(d.getDate()) + "_"
+                + pad(d.getHours()) + pad(d.getMinutes()) + pad(d.getSeconds()) + ".json";
+            const name = window.prompt("Save Option 1 & Option 2 preset as (.json, saved in presets/):", def);
+            if (!name) { return window.dash_clientside.no_update; }
+            return {"name": name, "t": Date.now()};
+        }
+        """,
+        Output("preset-save-request", "data"),
+        Input("btn-save-preset", "n_clicks"),
+        prevent_initial_call=True,
+    )
+
+    @app.callback(
+        Output("preset-status", "children"),
+        Input("preset-save-request", "data"),
+        State("global-h", "value"),
+        State("global-c", "value"),
+        State("global-l", "value"),
+        State("wb-0-h", "value"),
+        State("wb-0-c", "value"),
+        State("wb-0-l", "value"),
+        State("wb-1-h", "value"),
+        State("wb-1-c", "value"),
+        State("wb-1-l", "value"),
+        State("wb-2-h", "value"),
+        State("wb-2-c", "value"),
+        State("wb-2-l", "value"),
+        State("mixer-state-store", "data"),
+        State("ch-select-0", "value"),
+        State("ch-select-1", "value"),
+        State("ch-select-2", "value"),
+        prevent_initial_call=True,
+    )
+    def save_preset(request, gh, gc, gl, w0h, w0c, w0l, w1h, w1c, w1l, w2h, w2c, w2l, store_data, ch0, ch1, ch2):
+        if not request:
+            return no_update
+        try:
+            path = preset_path(request.get("name"))
+        except ValueError as exc:
+            return f"Preset not saved — invalid filename: {exc}."
+        if os.path.exists(path):
+            return f"Preset not saved — {os.path.relpath(path, PROJECT_DIR)} already exists; choose another name."
+        wb_lch = [
+            {"H": float(w0h), "C": float(w0c), "L": float(w0l)},
+            {"H": float(w1h), "C": float(w1c), "L": float(w1l)},
+            {"H": float(w2h), "C": float(w2c), "L": float(w2l)},
+        ]
+        preset = build_preset(
+            store_data["anchor_wb"], wb_lch, float(gh), float(gc), float(gl), (ch0, ch1, ch2), lch_to_rgbmix(wb_lch)
+        )
+        os.makedirs(PRESETS_DIR, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(preset, f, indent=2)
+        return f"Saved preset to {os.path.relpath(path, PROJECT_DIR)}"
+
+    # Eye toggles: swap the icon and dim the hidden channel's thumbnail.
+    eye_outputs = []
+    for k in range(3):
+        eye_outputs += [
+            Output(f"ch-eye-icon-{k}", "src"),
+            Output(f"ch-eye-{k}", "title"),
+            Output(f"img-channel-{k}", "style"),
+        ]
+
+    @app.callback(
+        *eye_outputs,
+        Input("ch-eye-0", "n_clicks"),
+        Input("ch-eye-1", "n_clicks"),
+        Input("ch-eye-2", "n_clicks"),
+        prevent_initial_call=True,
+    )
+    def update_eye_toggles(n0, n1, n2):
+        out = []
+        for n in (n0, n1, n2):
+            shown = channel_visible(n)
+            out += [
+                EYE_OPEN_URI if shown else EYE_CLOSED_URI,
+                "Hide this channel from the mix (preview only; sliders unchanged)" if shown else "Show this channel in the mix again",
+                {"width": "100%", "objectFit": "contain", "borderRadius": "4px", "display": "block", "opacity": "1" if shown else "0.25"},
+            ]
+        return tuple(out)
 
     @app.callback(
         Output("save-status", "children"),
@@ -1756,6 +2195,14 @@ def create_dash_app(cache: JP2ImageCache, output_dir: str) -> Dash:
         State("wb-2-h", "value"),
         State("wb-2-c", "value"),
         State("wb-2-l", "value"),
+        State("ch-select-0", "value"),
+        State("ch-select-1", "value"),
+        State("ch-select-2", "value"),
+        State("gamma", "value"),
+        State("contrast", "value"),
+        State("ch-eye-0", "n_clicks"),
+        State("ch-eye-1", "n_clicks"),
+        State("ch-eye-2", "n_clicks"),
         prevent_initial_call=True,
     )
     def save_full_res(
@@ -1769,7 +2216,19 @@ def create_dash_app(cache: JP2ImageCache, output_dir: str) -> Dash:
         w2h,
         w2c,
         w2l,
+        ch0,
+        ch1,
+        ch2,
+        gamma,
+        contrast,
+        eye0,
+        eye1,
+        eye2,
     ):
+        triplet = (ch0, ch1, ch2)
+        visible = visibility_mask(eye0, eye1, eye2)
+        gamma = float(gamma) if gamma else 1.0
+        contrast = float(contrast) if contrast else 0.0
         wb_lch = [
             {"H": float(w0h), "C": float(w0c), "L": float(w0l)},
             {"H": float(w1h), "C": float(w1c), "L": float(w1l)},
@@ -1778,33 +2237,55 @@ def create_dash_app(cache: JP2ImageCache, output_dir: str) -> Dash:
         rgbmix = lch_to_rgbmix(wb_lch)
 
         mixer = visualization.RGBMixer(
-            data_files=[[f] for f in cache.jp2_files],
+            data_files=[[cache.jp2_by_wavel[w]] for w in triplet],
             jp2=True,
             outputdir=output_dir,
         )
         mixer.set_jp2_default()
-        mixer.rgbmix = rgbmix
+        # Save what the preview shows: hidden channels are left out of the mix.
+        mixer.rgbmix = rgbmix * visible
+        mixer.gamma_rgb = (gamma, gamma, gamma)
+        mixer.contrast = contrast
+        mixer.contrast_mid = tuple(cache.get(triplet).contrast_mid(gamma, contrast))
         # Write the plain RGB-mixed output (exactly what the preview shows). The default lab=(1,1,1)
         # path is not an identity: it min/max-stretches the image and round-trips it through an
         # 8-bit CIELab quantization, so the saved file would differ from the on-screen preview.
         mixer.lab = None
         mixer.filename_lab = None
-        mixer.filename_rgb = "im_custom_lch_jp2"
+        hidden = "".join(f"_hide{w}" for w, v in zip(triplet, visible) if not v)
+        mixer.filename_rgb = f"im_custom_lch_jp2_{'_'.join(triplet)}{hidden}_gamma{gamma:.2f}_contrast{contrast:.1f}"
         mixer.process_rgb(0)
-        out_path = os.path.join(output_dir, "im_custom_lch_jp2_0000.jpeg")
+        out_path = os.path.join(output_dir, f"{mixer.filename_rgb}_0000.jpeg")
         return f"Saved full 4096×4096 image to: {out_path}"
 
     return app
 
 
-def find_sample_jp2_files(samples_dir: str) -> list[str]:
-    files = []
-    for wavel in ["304", "171", "193"]:
-        matches = sorted(glob.glob(os.path.join(samples_dir, f"*.{wavel}*.jp2")))
-        if not matches:
-            raise FileNotFoundError(f"No .jp2 file found for wavelength {wavel} in {samples_dir}")
-        files.append(matches[0])
+def find_sample_jp2_files(samples_dir: str) -> dict[str, str]:
+    """Map every AIA wavelength with a `*.<wavel>.jp2` file in samples_dir to that file."""
+    files = {}
+    for wavel in AIA_WAVELENGTHS:
+        matches = sorted(glob.glob(os.path.join(samples_dir, f"*.{wavel}.jp2")))
+        if matches:
+            files[wavel] = matches[0]
+    if len(files) < 3:
+        raise FileNotFoundError(f"Need .jp2 files for at least 3 AIA wavelengths in {samples_dir}, found {list(files)}")
     return files
+
+
+def default_triplet(wavelengths: list[str]) -> tuple[str, str, str]:
+    """304/171/193 when available (the set_jp2_default() assignment), else the first three found."""
+    if all(w in wavelengths for w in DEFAULT_TRIPLET):
+        return DEFAULT_TRIPLET
+    return tuple(wavelengths[:3])
+
+
+def waveband_role(slot: int, wavel: str) -> str:
+    return f"{RGB_SLOTS[slot]['name']} Input — {AIA_ROLES.get(wavel, 'AIA channel')}"
+
+
+def channel_caption(slot: int, wavel: str) -> str:
+    return f"{wavel} Å → {RGB_SLOTS[slot]['rgb']} input  ·  {aia_cmap_name(wavel)}"
 
 
 def main():
@@ -1812,7 +2293,7 @@ def main():
     parser.add_argument(
         "--samples-dir",
         default=os.path.abspath("samples"),
-        help="Directory containing sample .304., .171., and .193. jp2 files (default: ./samples)",
+        help="Directory containing sample *.<wavelength>.jp2 files, e.g. sample.304.jp2 (default: ./samples)",
     )
     parser.add_argument("--host", default="127.0.0.1", help="Host address (default: 127.0.0.1)")
     parser.add_argument("--port", type=int, default=8050, help="Port number (default: 8050)")
@@ -1820,7 +2301,7 @@ def main():
     args = parser.parse_args()
 
     jp2_files = find_sample_jp2_files(args.samples_dir)
-    print(f"Loading JP2 files: {jp2_files}")
+    print(f"Loading JP2 files: {list(jp2_files.values())}")
     cache = JP2ImageCache(jp2_files)
     app = create_dash_app(cache, output_dir=os.path.abspath(args.samples_dir))
     print(f"Starting Dash server at http://{args.host}:{args.port}")

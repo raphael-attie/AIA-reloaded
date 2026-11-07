@@ -18,7 +18,7 @@ Main python dependencies:
 * astropy
 * opencv (version 3.x.x or 4.x.x)
 * hvpy and tqdm (for downloading pre-calibrated JPEG2000 `.jp2` files via `get_data.py`)
-* [optional] dash (for running the interactive perceptual LCh / RGB mixer app `interactive_rgb_mixer.py`)
+* [optional] dash and `sunpy[visualization]` (for running the interactive perceptual LCh / RGB mixer app `interactive_rgb_mixer.py`; sunpy provides the SDO/AIA channel colormaps)
 * [optional] pytest if you wish to run the unit tests. 
 
 External dependencies:
@@ -225,20 +225,24 @@ Then open **http://127.0.0.1:8050** in your browser (by default it loads the thr
 
 #### Key features
 
-* **Auto-Balance Rules (Data-Driven, Color-Constancy & Color Harmony):** One-click presets computed from the on-disk pixels of the loaded `.jp2` images. Every preset is scaled so that the brightest 0.5% of actual on-disk pixels just reach full scale (no co-located-peak approximation):
-  1. **G2V Gray-World:** Solves for (non-negative) channel chromas against on-disk mean intensities so the disk-mean color is a warm G2V solar white.
-  2. **Warm–Cool Harmony:** Split-complementary thermal ordering placing `304 Å` at vermilion-orange ($24^\circ$) and `171 Å` at amber-gold ($106^\circ$), opposed by `193 Å` at complementary cerulean-blue ($245^\circ$).
-  3. **Equal Salience ($\Delta E$):** Scales each waveband so that a $1\sigma$ fluctuation produces the same color difference, $\sigma_k \lVert(L_k, C_k)\rVert$ = const, so `304 Å` prominences, `171 Å` coronal loops, and `193 Å` plumes contribute equal perceptual contrast (this brightens `193 Å`, giving a cooler palette).
-  4. **120° Oklch Triad:** Spaces the three wavebands $120^\circ$ apart ($18^\circ, 138^\circ, 258^\circ$) with mean-compensated chroma for zero net color cast and maximum chromatic separation.
-  5. **White-Patch (Max-RGB):** Von Kries per-output-channel gains on the default palette so the brightest structures (flares, active-region cores) render neutral white instead of tinted.
-  6. **Gray-Edge:** Color constancy on spatial gradients (van de Weijer et al. 2007): makes the mean color of edges (loops, network boundaries) neutral rather than the mean of all pixels.
-  7. **Decorrelation Stretch:** PCA-based decorrelation stretch (as used for multispectral planetary imagery): whitened opponent-chroma axes give maximal, balanced color separation of inter-waveband differences with zero net disk cast, keeping `304 Å` red and the default luminance.
+* **Auto-Balance Rules & Presets (top-left pane):**
+  * **Warm–Cool Harmony:** split-complementary thermal ordering placing the red input at vermilion-orange ($24^\circ$) and the green input at amber-gold ($106^\circ$), opposed by the blue input at complementary cerulean-blue ($245^\circ$), with chromas solved against the on-disk channel means for a slightly warm disk-mean color.
+  * **White-Patch (Max-RGB):** Von Kries per-output-channel gains on the default palette so the brightest structures (flares, active-region cores) render neutral white instead of tinted.
+  * Both rules are computed from the on-disk pixels of the selected wavelengths after the Tone Curve, and scaled so the brightest 0.5% of on-disk pixels just reach full scale.
+  * **Save Preset…:** asks for a filename (default `preset_<date>_<time>.json`) and writes the Option 1 (global) and Option 2 (per-waveband) slider settings to `presets/<name>.json` in the project folder. Existing files are never overwritten. The file also records the wavelengths and resulting `rgbmix` for reference.
+  * **Load Preset…:** opens the browser's file picker (navigate to `presets/` the first time; browsers do not let a page choose the starting folder) and restores both slider sets. Wavelengths, tone curve and channel visibility are left as they are.
 * **Option 1 — Global Perceptual LCh (3 Sliders + Color Wheel):**
   * **Global Hue Shift ($\Delta H^\circ$)**, **Global Chroma ($\times C$)**, and **Global Luminance ($\times L$)** sliders that rotate and scale the color balance across the entire Sun at constant perceptual lightness, paired with a live polar **Oklch Color Wheel** showing the positions of `304`, `171`, and `193`.
   * The Global Hue colorbar is computed from the rendered Sun itself: the color under the cursor is the dominant (lightness-weighted) hue the Sun takes at that shift, so placing the cursor on red gives a red Sun. The resulting Sun hue is shown next to the slider value.
 * **Option 2 — Per-Waveband LCh Controls (`304 Å`, `171 Å`, `193 Å`):**
   * Individual **Hue**, **Chroma**, and **Luminance** sliders for each waveband (corresponding to the 3 columns of `self.rgbmix`). Option 1 and Option 2 sliders stay bidirectionally synchronized, and every slider rides directly on a live gradient colorbar with a color-matched thumb.
 * **Real-Time Comparison & Export:**
-  * Switch between Full Sun previews (`1024×1024` / `1536×1536`), a 16:9 bottom-half crop, or 1:1 native pixel zooms on the erupting prominence and active region loops, displayed side-by-side against `set_jp2_default()`.
+  * **Channel visibility (eye) toggles:** an eye button on each input-channel thumbnail hides that channel from the mix (its `self.rgbmix` column is zeroed for display only) to see what each wavelength contributes. No slider, anchor or preset is changed to compensate, the exported matrix stays the full mix, and showing the channel again restores the exact image. A full-resolution save matches the preview and is tagged, e.g. `..._hide171_gamma1.00_contrast0.0_0000.jpeg`.
+  * **Tone Curve panel** (directly below the mixed image): applied to each input channel before mixing, exactly as `visualization.scale_rgb` does, so the full-resolution save and the copied snippet reproduce the preview.
+    * **Gamma γ:** maps $x \in [0, 1]$ to $x^{1/\gamma}$ (`RGBMixer.gamma_rgb`). $\gamma > 1$ lifts faint loops and off-limb corona strongly (e.g. at $\gamma = 2$: $0.1 \to 0.32$) while already-bright structures barely change ($0.9 \to 0.95$), but it also flattens mid-tone contrast.
+    * **Contrast:** a normalized sigmoidal S-curve (`visualization.sigmoid_contrast`, `RGBMixer.contrast` / `RGBMixer.contrast_mid`) applied after gamma. Each channel gets its own pivot (`visualization.mean_preserving_midpoint`), chosen so that channel's mean level is unchanged; because the mix is linear, contrast then changes neither the overall brightness nor the color balance, whatever the Option 1/2 sliders (a single shared pivot used to brighten mixes dominated by 304/193 Å much more than others). It steepens the mid-tones to restore the contrast lost to gamma while keeping black at 0 and white at 1, so nothing clips. 0 turns it off (the pipeline default).
+    * Auto-Balance presets, the Global Hue colorbar and the balance metrics are computed on the tone-mapped inputs.
+  * **Wavelength selector:** every `*.<wavelength>.jp2` file in the samples folder is loaded (e.g. `sample.131.jp2`, `sample.211.jp2`, downloadable with `get_data.py`). A dropdown above each input-channel image assigns any wavelength to the R, G or B input (one column of `self.rgbmix`); the mix, statistics, Auto-Balance presets and all labels update immediately. Saved images are named after the assignment and the Tone Curve settings, e.g. `im_custom_lch_jp2_304_171_211_gamma2.00_contrast6.0_0000.jpeg`.
+  * Switch between Full Sun previews (`1024×1024` / `1536×1536`), a 16:9 bottom-half crop, or 1:1 native pixel zooms on the erupting prominence and active region loops. The live mix is displayed side-by-side with the three selected input channels (default `304 Å` → R, `171 Å` → G, `193 Å` → B), each rendered in its standard sunpy SDO/AIA colormap (`sdoaia304`, `sdoaia171`, …), or the input channels can be shown alone in a row.
   * Copy the live-generated `self.rgbmix = np.array([...])` code snippet directly into `visualization.py`, or click **Save Full 4096×4096 JPEG to `samples/`** to render the full-resolution image via `RGBMixer`.
 

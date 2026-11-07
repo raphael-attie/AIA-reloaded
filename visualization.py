@@ -81,6 +81,12 @@ class RGBMixer:
 
         # Intensity gamma scaling factors for tone-mapping the 3x12 bit high dynamic range into the 3x8 bit range
         self.gamma_rgb = (1.0, 1.0, 1.0)
+        # Sigmoidal contrast applied to each channel after gamma (0 = off), pivoting at contrast_mid
+        # (a scalar or one pivot per channel). Restores the mid-tone contrast that gamma > 1 flattens,
+        # without clipping black or white. Use mean_preserving_midpoint() for per-channel pivots that
+        # keep each channel's mean level, so contrast does not also change brightness or color balance.
+        self.contrast = 0.0
+        self.contrast_mid = 0.5
         self.rgbmix = np.array([[1, 0, 0],
                                 [0, 1, 0],
                                 [0, 0, 1]])
@@ -163,6 +169,8 @@ class RGBMixer:
                                                    calibrate=self.calibrate, jp2=self.jp2,
                                                    scalemin=self.scalemin,
                                                    gamma_rgb=self.gamma_rgb,
+                                                   contrast=self.contrast,
+                                                   contrast_mid=self.contrast_mid,
                                                    rgbmix=self.rgbmix,
                                                    lab=self.lab,
                                                    lmin=self.lmin,
@@ -198,7 +206,58 @@ def rgb_high_low(rgb_files, percentiles_low, percentiles_high):
     return rgblow, rgbhigh
 
 
-def scale_rgb(rgb, rgblow, rgbhigh, gamma_rgb=(2.8, 2.8, 2.4), rgbmix=None, scalemin=0):
+def sigmoid_contrast(x, strength, midpoint=0.5):
+    """
+    Normalized sigmoidal contrast curve on [0, 1] data (as ImageMagick's -sigmoidal-contrast).
+    Steepens the mid-tones around `midpoint` while keeping 0 -> 0 and 1 -> 1, so nothing clips.
+
+    :param x: array with values in [0, 1]
+    :param strength: slope of the sigmoid; 0 (or less) returns x unchanged, ~3 is mild, ~10 is strong.
+    :param midpoint: pivot value in [0, 1] whose neighborhood gains the most contrast.
+    :return: array of the same shape and dtype as x
+    """
+    if strength <= 1e-6:
+        return x
+    x = np.asarray(x)
+    dtype = x.dtype.type if np.issubdtype(x.dtype, np.floating) else np.float64
+    k, m = dtype(strength), dtype(midpoint)  # keep float32 inputs in float32 (speed)
+    lo = 1.0 / (1.0 + np.exp(-strength * (0.0 - midpoint)))
+    hi = 1.0 / (1.0 + np.exp(-strength * (1.0 - midpoint)))
+    y = 1.0 / (1.0 + np.exp(-k * (x - m)))
+    return np.clip((y - dtype(lo)) / dtype(hi - lo), 0.0, 1.0).astype(dtype, copy=False)
+
+
+def mean_preserving_midpoint(x, strength, tol=1e-4):
+    """
+    Pivot m for sigmoid_contrast(x, strength, m) such that the mean of the output equals the mean of x.
+
+    With one pivot per channel chosen this way, the contrast curve leaves every channel's mean level
+    unchanged; since RGB mixing is linear, the mean of any mixed output is then unchanged too
+    (before clipping), whatever the mixing matrix. A shared pivot instead brightens channels whose
+    values sit mostly above it and darkens the others, so the overall brightness and color would
+    depend on the mixing weights.
+
+    :param x: sample of the channel's values in [0, 1] (e.g. on-disk pixels after gamma)
+    :param strength: sigmoid strength as in sigmoid_contrast
+    :return: pivot in [0, 1]
+    """
+    x = np.asarray(x, dtype=np.float64).ravel()
+    if strength <= 1e-6 or x.size == 0:
+        return 0.5
+    target = float(x.mean())
+    lo, hi = 0.0, 1.0  # the output mean decreases monotonically as the pivot moves right
+    for _ in range(60):
+        mid = 0.5 * (lo + hi)
+        if float(sigmoid_contrast(x, strength, mid).mean()) > target:
+            lo = mid
+        else:
+            hi = mid
+        if hi - lo < tol:
+            break
+    return 0.5 * (lo + hi)
+
+
+def scale_rgb(rgb, rgblow, rgbhigh, gamma_rgb=(2.8, 2.8, 2.4), rgbmix=None, scalemin=0, contrast=0.0, contrast_mid=0.5):
     """ Rescale the rgb image series.
     First linearly rescales between minimum and maximum values independently on each channel.
     Apply gamma-scaling on the [0-1]-normalized channels.
@@ -211,6 +270,9 @@ def scale_rgb(rgb, rgblow, rgbhigh, gamma_rgb=(2.8, 2.8, 2.4), rgbmix=None, scal
     This is meant to be a single value and not a channel-dependent parameter.
     :param rgbmix: rgb mixing matrix in [red, green, blue] order in both dimensions.
     :param scalemin: minimum value for optional contrast stretching after gamma-scaling.
+    :param contrast: strength of the sigmoidal contrast applied to each channel after gamma (0 = off).
+    :param contrast_mid: pivot of the sigmoidal contrast in the [0, 1] gamma-scaled range: a scalar,
+    or one value per channel (see mean_preserving_midpoint).
     :return: rescaled rgb image as numpy 3D array: [height, width, rgb channels]
     """
 
@@ -222,7 +284,8 @@ def scale_rgb(rgb, rgblow, rgbhigh, gamma_rgb=(2.8, 2.8, 2.4), rgbmix=None, scal
         rgb2[i] = (rgb[i] - rgblow[i]) * 1 / (rgbhigh[i] - rgblow[i])
         rgb2[i].clip(0, 1, out=rgb2[i])
 
-    red, green, blue = [(channel ** gamma) for (channel, gamma) in zip(rgb2, rgb_gamma)]
+    mids = np.broadcast_to(np.asarray(contrast_mid, dtype=np.float64), (3,))
+    red, green, blue = [sigmoid_contrast(channel ** gamma, contrast, mid) for (channel, gamma, mid) in zip(rgb2, rgb_gamma, mids)]
 
     # Apply color mixing
     if rgbmix is not None:
@@ -276,7 +339,7 @@ def process_lab_32bit(bgr, lf=1, af=1, bf=1, lmin=0):
     return lab
 
 
-def process_rgb_image(i, data_files, rgblow, rgbhigh, calibrate=True, jp2=False, gamma_rgb=(2.8, 2.8, 2.4), scalemin=0, rgbmix=None, lab=None, lmin=0, crop=None, filename_rgb=None, filename_lab=None):
+def process_rgb_image(i, data_files, rgblow, rgbhigh, calibrate=True, jp2=False, gamma_rgb=(2.8, 2.8, 2.4), scalemin=0, rgbmix=None, lab=None, lmin=0, crop=None, filename_rgb=None, filename_lab=None, contrast=0.0, contrast_mid=0.5):
     """
     Create an rgb image out of three fits or jp2 files at different wavelengths, conveniently scaled for visualization.
 
@@ -288,6 +351,8 @@ def process_rgb_image(i, data_files, rgblow, rgbhigh, calibrate=True, jp2=False,
     :param jp2: True if input files are pre-calibrated JPEG2000 (.jp2) images.
     :param gamma_rgb: gamma scaling factor for tone-mapping each channel from 3x12 bit hdr intensity to 3x8 bit
     :param scalemin: minimum intensity for contrast stretching
+    :param contrast: strength of the sigmoidal contrast applied to each channel after gamma (0 = off)
+    :param contrast_mid: pivot of the sigmoidal contrast in the [0, 1] gamma-scaled range (scalar or per channel)
     :param rgbmix: 3x3 array of mixing parameters of the rgb channels.
     :param lab: CIELab parameters
     :param lmin: optionnaly used with lab. Minimum luminance for rescaling into the 8 bit range.
@@ -308,7 +373,8 @@ def process_rgb_image(i, data_files, rgblow, rgbhigh, calibrate=True, jp2=False,
         pdatargb = [load_fits(data_files[j][i]) for j in range(3)]
 
     # Apply hdr tone-mapping
-    im_rgb255 = scale_rgb(pdatargb, rgblow, rgbhigh, gamma_rgb=gamma_rgb, scalemin=scalemin, rgbmix=rgbmix)
+    im_rgb255 = scale_rgb(pdatargb, rgblow, rgbhigh, gamma_rgb=gamma_rgb, scalemin=scalemin, rgbmix=rgbmix,
+                          contrast=contrast, contrast_mid=contrast_mid)
 
     # OpenCV orders channels as B,G,R instead of R,G,B. FITS files also need to be flipped upside down.
     if jp2:
