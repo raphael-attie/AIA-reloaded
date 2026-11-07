@@ -337,7 +337,8 @@ def process_rgb_image(i, data_files, rgblow, rgbhigh, calibrate=True, jp2=False,
     return bgr_stack1, bgr_stack2
 
 
-def encode_video(images_dir, movie_filename, image_format='jpeg', fps=30, file_ext='.mp4', crop=None, frame_size=None, padded_size=None, image_pattern_search=None, command_only=False):
+def encode_video(images_dir, movie_filename, image_format='jpeg', fps=30, file_ext='.mp4',
+                 crop=None, frame_size=None, padded_size=None, image_pattern_search=None, command_only=False):
     """
     Run ffmpeg to create a movie from jpeg images. Input images will be found based on the image directory and a pattern search.
     If you're writing images with your own methods, use padded numbering: 001, 002, ..., 010 instead of 1,2,...10
@@ -408,7 +409,7 @@ def encode_video(images_dir, movie_filename, image_format='jpeg', fps=30, file_e
                "-i", image_pattern_search,
                "-c:v", "libx264",
                "-preset", "slow",
-               "-crf", "18",
+               "-crf", "26",
                "-r", "30",
                "-vf", video_filter,
                "-pix_fmt", "yuv420p",

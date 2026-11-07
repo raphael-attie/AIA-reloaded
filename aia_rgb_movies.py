@@ -6,7 +6,7 @@ import visualization
 
 
 # Directory of the rgb images
-images_dir = '/Users/rattie/Data/SDO/AIA/event_2012_08_31/rgb'
+images_dir = '/Users/rattie/Data/AIA/event_2012_08_31/rgb'
 
 if __name__ == '__main__':
     # Use uncropped images at 1/2 resolution (4096 x 4096 -> 2048 x 2048) - this only makes sense on 4k or 5k screens
@@ -35,7 +35,7 @@ if __name__ == '__main__':
     # Encode movie
     visualization.encode_video(images_dir, filename, crop=crop, frame_size=frame_size)
 
-    # With a 16:9 aspect ratio, crop over 3840 x 2160 around bottom half and output at full HD resolution (1920 x 1080)
+    # With a 16:9 aspect ratio, crop over 3840 x 2160 around bottom half and output at full-HD resolution (1920 x 1080)
     crop = [3840, 2160, 128, 1935]
     frame_size = (1920, 1080)
     filename = 'rgb_movie_3840x2160_1920x1080'
