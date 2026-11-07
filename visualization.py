@@ -17,7 +17,7 @@ class RGBMixer:
     Next, ffmpeg is called to create a movie from the jpeg files.
     """
 
-    def __init__(self, data_dir=None, wavel_dirs=None, data_files=None, calibrate=True, outputdir=None, ref=0, crop=None,
+    def __init__(self, data_dir=None, wavel_dirs=None, data_files=None, calibrate=True, jp2=False, outputdir=None, ref=0, crop=None,
                  filename_lab=None, filename_rgb=None):
         """
 
@@ -27,6 +27,7 @@ class RGBMixer:
         the paths must be relative to data_dir.
         :param data_files: list of RGB files. data_files[rgb channel][image index]. data_dir or data_files must be present.
         :param calibrate: set to True if the aia fits files need to be calitrated.
+        :param jp2: set to True if input files are pre-calibrated JPEG2000 (.jp2) images.
         :param ref: index of the reference image used to get the intensity scaling values
         :param outputdir: directory for the output rgb images
         :param crop: (x,y)=(cols, rows) coordinates for cropping. E.g (slice(0,1024), slice(100,3200))
@@ -35,6 +36,7 @@ class RGBMixer:
         """
 
         self.data_dir = data_dir
+        self.jp2 = jp2
 
         if data_files is None and wavel_dirs is None:
             raise ValueError('Missing input directory or files. Need either data_dir AND wavel_dirs, OR data_files')
@@ -54,11 +56,12 @@ class RGBMixer:
             self.data_files = data_files
         else:
             if os.path.isdir(self.wavel_dirs[0]) and os.path.isdir(self.wavel_dirs[1]) and os.path.isdir(self.wavel_dirs[2]):
-                self.data_files = [sorted(glob.glob(os.path.join(ddir, '*.fits'))) for ddir in self.wavel_dirs]
+                ext = '*.jp2' if self.jp2 else '*.fits'
+                self.data_files = [sorted(glob.glob(os.path.join(ddir, ext))) for ddir in self.wavel_dirs]
             else:
                 raise ValueError('wavelength directories do not exist')
 
-        self.calibrate = calibrate
+        self.calibrate = False if self.jp2 else calibrate
         self.ref_rgb_files = [files[ref] for files in self.data_files]
         self.crop = crop
         # Reference image index to extract scaling values
@@ -74,15 +77,15 @@ class RGBMixer:
         self.filename_lab = filename_lab
         # Intensity percentiles for linear scaling
         self.percentiles_low = (0, 0, 0)
-        self.percentiles_high = (99.99, 99.99, 99.99)
+        self.percentiles_high = (100, 100, 100)
 
         # Intensity gamma scaling factors for tone-mapping the 3x12 bit high dynamic range into the 3x8 bit range
-        self.gamma_rgb = (1, 1, 1)
+        self.gamma_rgb = (1.0, 1.0, 1.0)
         self.rgbmix = np.array([[1, 0, 0],
                                 [0, 1, 0],
                                 [0, 0, 1]])
         # [Optional processing] CIELab parameters. Make 10% brighter, skew the chromaticity toward red and yellow
-        self.lab = None
+        self.lab = (1.0, 1.0, 1.0)
         # For contrast stretching on luminance (L) layer. L ranges in [0-255]
         self.lmin = 0
         # Reference rgb image used for the intensity scaling values
@@ -101,6 +104,8 @@ class RGBMixer:
         return None
 
     def set_aia_default(self):
+        if self.jp2:
+            return self.set_jp2_default()
 
         # Load and prep reference image
         if self.calibrate:
@@ -122,6 +127,24 @@ class RGBMixer:
         self.filename_lab = 'im_lab'
         self.set_ref_low_high()
 
+    def set_jp2_default(self):
+        # Load pre-calibrated JPEG2000 reference images
+        self.ref_rgb = [load_jp2(jp2file) for jp2file in self.ref_rgb_files]
+
+        self.percentiles_low = (0, 0, 0)
+        self.percentiles_high = (100, 100, 100)
+
+        self.rgbmix = np.array([[1.045, 0.635, -0.295],
+                                [0.0,   0.955,  0.095],
+                                [0.0,   0.195,  0.565]])
+
+        self.gamma_rgb = (1.0, 1.0, 1.0)
+        self.scalemin = 0
+        self.lab = (1.0, 1.0, 1.0)
+        self.lmin = 0
+        self.filename_lab = 'im_lab_jp2'
+        self.set_ref_low_high()
+
     def set_ref_low_high(self, plow=None, phigh=None):
 
         if plow is None:
@@ -137,7 +160,8 @@ class RGBMixer:
 
         bgr_stack1, bgr_stack2 = process_rgb_image(image_index, data_files=self.data_files,
                                                    rgblow=self.rgblow, rgbhigh=self.rgbhigh,
-                                                   calibrate=self.calibrate, scalemin=self.scalemin,
+                                                   calibrate=self.calibrate, jp2=self.jp2,
+                                                   scalemin=self.scalemin,
                                                    gamma_rgb=self.gamma_rgb,
                                                    rgbmix=self.rgbmix,
                                                    lab=self.lab,
@@ -252,15 +276,16 @@ def process_lab_32bit(bgr, lf=1, af=1, bf=1, lmin=0):
     return lab
 
 
-def process_rgb_image(i, data_files, rgblow, rgbhigh, calibrate=True, gamma_rgb=(2.8, 2.8, 2.4), scalemin=0, rgbmix=None, lab=None, lmin=0, crop=None, filename_rgb=None, filename_lab=None):
+def process_rgb_image(i, data_files, rgblow, rgbhigh, calibrate=True, jp2=False, gamma_rgb=(2.8, 2.8, 2.4), scalemin=0, rgbmix=None, lab=None, lmin=0, crop=None, filename_rgb=None, filename_lab=None):
     """
-    Create an rgb image out of three fits files at different wavelengths, conveniently scaled for visualization.
+    Create an rgb image out of three fits or jp2 files at different wavelengths, conveniently scaled for visualization.
 
     :param i: image index in the list of file
     :param data_files: list of RGB files. The list is 2D: [rgb channels][image index]
     :param rgblow: minimum intensity value(s) for rescaling. scalar or 3-element numpy array.
     :param rgbhigh: maximum intensity value(s) for rescaling. scalar or 3-element numpy array.
     :param calibrate: True if you need to calibrate from raw fits files.
+    :param jp2: True if input files are pre-calibrated JPEG2000 (.jp2) images.
     :param gamma_rgb: gamma scaling factor for tone-mapping each channel from 3x12 bit hdr intensity to 3x8 bit
     :param scalemin: minimum intensity for contrast stretching
     :param rgbmix: 3x3 array of mixing parameters of the rgb channels.
@@ -275,7 +300,9 @@ def process_rgb_image(i, data_files, rgblow, rgbhigh, calibrate=True, gamma_rgb=
     bgr_stack2 = None
 
     # Prep aia data and export the r,g,b arrays into a list of numpy arrays.
-    if calibrate:
+    if jp2:
+        pdatargb = [load_jp2(data_files[j][i]) for j in range(3)]
+    elif calibrate:
         pdatargb = [calibration.aiaprep(data_files[j][i]) for j in range(3)]
     else:
         pdatargb = [load_fits(data_files[j][i]) for j in range(3)]
@@ -283,8 +310,11 @@ def process_rgb_image(i, data_files, rgblow, rgbhigh, calibrate=True, gamma_rgb=
     # Apply hdr tone-mapping
     im_rgb255 = scale_rgb(pdatargb, rgblow, rgbhigh, gamma_rgb=gamma_rgb, scalemin=scalemin, rgbmix=rgbmix)
 
-    # OpenCV orders channels as B,G,R instead of R,G,B, and flip upside down.
-    bgr_stack = np.flipud(np.flip(im_rgb255, axis=2))
+    # OpenCV orders channels as B,G,R instead of R,G,B. FITS files also need to be flipped upside down.
+    if jp2:
+        bgr_stack = np.flip(im_rgb255, axis=2)
+    else:
+        bgr_stack = np.flipud(np.flip(im_rgb255, axis=2))
 
     bgr_stack1 = np.clip(bgr_stack, 0, 255)
     bgr_stack1 = bgr_stack1.astype(np.uint8)
@@ -417,3 +447,16 @@ def load_fits(fitsfile):
             return data
     except FileNotFoundError:
         print("Could not open fits file")
+
+
+def load_jp2(jp2file):
+    """
+    Load a pre-calibrated JPEG2000 (.jp2) image as a 2D float64 numpy array.
+
+    :param jp2file: path to jp2 file
+    :return: 2D numpy array of image intensities
+    """
+    data = cv2.imread(jp2file, cv2.IMREAD_UNCHANGED)
+    if data is None:
+        raise FileNotFoundError(f"Could not open jp2 file: {jp2file}")
+    return data.astype(np.float64)

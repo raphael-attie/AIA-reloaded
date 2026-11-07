@@ -121,7 +121,7 @@ Video at: https://youtu.be/XyqYKlLQZ8o (make sure you set the maximum resolution
 Having such 16:9 ratio usually enables your computer to decode and play the video more efficiently than a less "standard" geometry. 4:3 is also a standard geometry that plays nicely in modest computers and older softwares. Youtube players work best at 16:9. The file size is the same, as the padding only add zeros. 
 The file size of the above videos is ~5.5 MB. 
 
-Another example is if you want a close-up on the sun, so you can view a sub-field of the sun at higher resolution. Here, we crop a 3840x2160 section (which is a 16:9 geometry) off the 4096x4096 frame, and encode this again at 1920x1080, although we do not need to pad anything and exploit thus the full resolution of a typical display. 
+Another example is if you want a close-up on the sun, so you can view a sub-field of the sun at higher resolution. Here, we crop a 3840x2160 section (which is a 16:9 geometry) off the 4096x4096 frame, and encode this again at 1920x1080, although we do not need to pad anything, we can exploit the full resolution of a typical display. 
 
 ```python
     image_pattern_search = "im_lab_0*.jpeg"

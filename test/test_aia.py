@@ -90,6 +90,20 @@ def test_aia_rgb_crop_xy():
     assert os.path.isfile(aia_mixer.filepath_lab + '_%04d.jpeg' % 0)
 
 
+def test_aia_rgb_jp2_sample():
+    aia_mixer = RGBMixer(
+        data_files=[glob.glob(os.path.join(SAMPLES_DIR, '*.%s*.jp2' % wavel)) for wavel in ['304', '171', '193']],
+        jp2=True,
+        outputdir=SAMPLES_DIR)
+    aia_mixer.set_jp2_default()
+
+    bgr1, bgr2 = aia_mixer.process_rgb(0)
+
+    assert bgr1.shape == (4096, 4096, 3)
+    assert bgr2.shape == (4096, 4096, 3)
+    assert os.path.isfile(aia_mixer.filepath_lab + '_%04d.jpeg' % 0)
+
+
 
 
 

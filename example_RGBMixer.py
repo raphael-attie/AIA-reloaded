@@ -9,6 +9,9 @@ aia_mixer = RGBMixer(
     outputdir = os.path.abspath('samples/'))
 aia_mixer.set_aia_default()
 
+# Output the full-size (4096x4096) image (uses default filename_lab = 'im_lab')
+_ = aia_mixer.process_rgb(0)
+
 # Example of cropping in (x, y) = (cols, rows) coordinates.
 # Combined with the extra 2x downsampled version of the RGBMixer, this will create also images in
 # full HD (1920x1080) that do not need require ffmpeg to apply a lossy, blurring rescaling.
