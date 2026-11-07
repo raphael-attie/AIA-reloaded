@@ -16,7 +16,8 @@ Main python dependencies:
 * Python 3 (tested on 3.5 and above)
 * numpy 
 * astropy
-* opencv (version 3.x.x)
+* opencv (version 3.x.x or 4.x.x)
+* hvpy and tqdm (for downloading pre-calibrated JPEG2000 `.jp2` files via `get_data.py`)
 * [optional] pytest if you wish to run the unit tests. 
 
 External dependencies:
@@ -24,37 +25,65 @@ External dependencies:
  
 If you wish to run the test functions with **pytest**: 
 
-* create an **aia_data** directory in the parent directory
-
-* Download the 3 test raw AIA fits files and place them into the **aia_data** directory:
-  * [AIA 171](https://drive.google.com/open?id=1-qT9RFb8NXFWlhbvNVVXm52JJ0cjLJyV)
-  * [AIA 193](https://drive.google.com/open?id=1NCVU91LQoFfmZMdg9eFec6nzdDf6q7Qx)
-  * [AIA 304](https://drive.google.com/open?id=1lCoKH_BghuCuFwsrTVbtBz76ynVG_NQP)
-  
+* Sample `.fits` and `.jp2` files for the 3 wavebands (171, 193, 304) are located in the **samples** directory (original raw FITS test files are also available at [AIA 171](https://drive.google.com/open?id=1-qT9RFb8NXFWlhbvNVVXm52JJ0cjLJyV), [AIA 193](https://drive.google.com/open?id=1NCVU91LQoFfmZMdg9eFec6nzdDf6q7Qx), and [AIA 304](https://drive.google.com/open?id=1lCoKH_BghuCuFwsrTVbtBz76ynVG_NQP)).
 * From the terminal, go into the project directory and run **pytest test/test_aia.py -v**
 
 ### How does it work? 
 
-This framework assumes you know how to download the raw fits files from SDO/AIA. 
-An example of the rgb image processing is given in **example_RGBMixer.py**. After calibrating the raw fits files (remapping to equal plate scales and rotations if needed), the intensity in each channel is rescaled non-linearly. Our examples use the wavebands centered at 304 (red channel), 171 (green channel) and 193 Anstrom (blue channel). Default rescaling parameters are provided but the method is meant to accept your own color mixing and rescaling parameters. 
-To create movies, see examples in **aia_rgb_movies.py**. A full pipeline example is given in **script_full_pipeline.py**
+#### Preferred workflow: Pre-calibrated JPEG2000 (`.jp2`) files vs. raw FITS files
+
+While this framework supports raw SDO/AIA `.fits` files (which require downloading large uncompressed files and running the computationally expensive `aiaprep` calibration step to remap plate scales and rotations), **the preferred alternative is to use pre-calibrated JPEG2000 (`.jp2`) files** from Helioviewer:
+
+* **Much smaller & faster to download**: `.jp2` files are a fraction of the size of raw FITS files and can be downloaded directly over any UTC time range using the included `get_data.py` script (powered by `hvpy`).
+* **Pre-calibrated & faster to process**: Helioviewer `.jp2` images are already aligned, prepped, and intensity-scaled, bypassing `aiaprep` calibration and non-linear gamma rescaling while applying dedicated default color mixing parameters (`set_jp2_default()`).
+
+An example of single-frame RGB image processing is given in **example_RGBMixer.py**. Our examples use the wavebands centered at 304 (red channel), 171 (green channel) and 193 Angstrom (blue channel). Default rescaling and color mixing parameters are provided for both `.jp2` and `.fits` inputs, and can be customized.
+A full pipeline script for `.jp2` series (including movie creation) is provided in **script_full_pipeline.py**, and standalone movies can be encoded directly from a folder of RGB images using **create_movie.py** (see examples below).
 The assignment of these wavebands to these colors is chosen in accordance to general human perception of colors. To that end, we are studying how to best make use of the CIE-based color spaces (e.g: CIELab, CIELuv, ...) instead of directly acting on the mixing between the RGB components which is not always the most intuitive or natural way to obtain the results we want. 
 
 ### Getting started
 
-Example using the 3 samples from above that writes a .jpeg file of a colored image with default scaling and color mixing parameters. 
-The .jpeg file is written in the **aia_data** directory where you put the 3 samples.
+#### 1. Downloading and processing `.jp2` files (Recommended)
+
+You can download a time series of pre-calibrated `.jp2` files using `get_data.py`:
+
+```bash
+python get_data.py "2012-08-31 18:00" "2012-08-31 22:00" --cadence 36 --wavelengths 304 171 193 --base-dir ~/data/AIA
+```
+
+This creates an event folder (`~/data/AIA/event_2012-08-31_1800_2012-08-31_2200/`) with `304/`, `171/`, and `193/` subdirectories. You can then run the full pipeline script to generate all RGB/CIELab `.jpeg` frames in parallel and encode the `.mp4` movie:
+
+```bash
+python script_full_pipeline.py ~/data/AIA/event_2012-08-31_1800_2012-08-31_2200 -w 304 171 193 -n 4
+```
+
+Or in Python using `RGBMixer` with `jp2=True` (for example, using the included `.jp2` files in `samples/`):
 
 ```python
 import os, glob
 from visualization import RGBMixer
 
-## Create rgb image using the default aia rgb mixer.
-# This example provides the data file paths and output directory
-
 aia_mixer = RGBMixer(
-    data_files = [glob.glob('../aia_data/*.%s*.fits'%wavel) for wavel in ['304', '171', '193']],
-    outputdir = os.path.abspath('../aia_data/'))
+    data_files=[glob.glob('samples/*.%s*.jp2' % wavel) for wavel in ['304', '171', '193']],
+    jp2=True,
+    outputdir=os.path.abspath('samples/'))
+aia_mixer.set_jp2_default()
+
+aia_mixer.process_rgb(0)
+```
+
+#### 2. Processing raw `.fits` files
+
+If you are working with raw FITS files instead, omit `jp2=True` and call `set_aia_default()`. Here is an example using the 3 sample FITS files in `samples/` that writes a `.jpeg` image with default FITS calibration, scaling, and color mixing parameters:
+
+```python
+import os, glob
+from visualization import RGBMixer
+
+## Create rgb image using the default aia rgb mixer for raw FITS files.
+aia_mixer = RGBMixer(
+    data_files=[glob.glob('samples/*.%s*.fits' % wavel) for wavel in ['304', '171', '193']],
+    outputdir=os.path.abspath('samples/'))
 aia_mixer.set_aia_default()
 
 aia_mixer.process_rgb(0)
@@ -69,9 +98,9 @@ We also provide options to create videos and crop within the full resolution ima
 aia_mixer.crop = (slice(0, 4096), slice(2048, 4096)) # (x, y) = (cols, rows) slices
 ```
 
-To create movies, you'll process multiple rgb images from a list of raw fits files. Instead of ```aia_mixer.process_rgb(0)``` you would use ```aia_mixer.process_rgb_list(ncores, file_range)``` where e.g: ```file_range = range(200)``` to process images, and ```ncores = 4``` to parralelize over 4 workers. 
+To create movies in Python, you'll process multiple RGB images from a directory of `.jp2` (or `.fits`) files. Instead of ```aia_mixer.process_rgb(0)``` you would use ```aia_mixer.process_rgb_list(ncores, file_range)``` where e.g: ```file_range = range(200)``` to process images, and ```ncores = 4``` to parallelize over 4 workers. 
 
-Here is an example of full pipeline for processing, say the first 225 images present in your directory and create movie of of the full sun with a square resolution of 1080x1080:
+Here is an example of the full pipeline in Python for processing a series of `.jp2` images (or `.fits` images if `jp2=False`) and creating a movie of the full sun with a square resolution of 1080x1080:
 
 ```python
 import os
@@ -80,30 +109,61 @@ import visualization
 # Set parallelization. To disable, set ncores to 1. Try to leave 1 or 2 cores available in your machine if you want to keep working normally:
 # E.g., if you have 8 cores in your computer (whether virtual cores or physical cores). Use maximum ncores = 6
 ncores = 4
-# Range of images indices to process.
-file_range = range(225)
+
+data_dir = os.path.expanduser('~/data/AIA/event_2012-08-31_1800_2012-08-31_2200')
+outputdir = os.path.join(data_dir, 'rgb_images')
+os.makedirs(outputdir, exist_ok=True)
 
 aia_mixer = visualization.RGBMixer(
-    data_dir=os.path.expanduser('~/Data/SDO/AIA/event_2012_08_31/'),
+    data_dir=data_dir,
     wavel_dirs=['304', '171', '193'],
-    outputdir=os.path.abspath('../aia_data/'))
-aia_mixer.set_aia_default()
-aia_mixer.filename_lab = 'im_lab'
+    jp2=True,  # Set to False if using raw .fits files
+    outputdir=outputdir)
+aia_mixer.set_jp2_default()  # Or aia_mixer.set_aia_default() for .fits files
 
-aia_mixer.process_rgb_list(ncores, file_range)
+# Process all available frames (or pass a specific range, e.g. range(225))
+n_frames = min(len(files) for files in aia_mixer.data_files)
+aia_mixer.process_rgb_list(ncores, range(n_frames))
+```
 
-'''
-This will be followed by the encoding of the movie with FFMPEG:
+This will be followed by the encoding of the movie with FFMPEG. Once the RGB `.jpeg` images are available in a folder, you can encode movies either **directly from the terminal using `create_movie.py`** (without writing any Python setup code) or **in Python using `visualization.encode_video()`**.
 
-'''python
+#### Option A: Creating movies from the command line with `create_movie.py`
+
+`create_movie.py` wraps `visualization.encode_video()` in a command-line interface and automatically generates a descriptive `.mp4` filename in the parent event directory (unless `-o/--output` is specified):
+
+```bash
+# Full sun rescaled to 1080x1080 px (or -s 2048 2048 for 1/2 resolution on 4K/5K screens)
+python create_movie.py ~/data/AIA/event_2012-08-31_1800_2012-08-31_2200/rgb_images -s 1080 1080
+
+# Full sun rescaled to 1080x1080 and padded to 16:9 (1920x1080) for optimized YouTube streaming
+python create_movie.py ~/data/AIA/event_2012-08-31_1800_2012-08-31_2200/rgb_images -s 1080 1080 -p 1920 1080
+
+# 16:9 close-up crop [width height x y] around the bottom half, output at Full HD (1920x1080) or 4K (-s 3840 2160)
+python create_movie.py ~/data/AIA/event_2012-08-31_1800_2012-08-31_2200/rgb_images -c 3840 2160 128 1936 -s 1920 1080
+
+# Square 2048x2048 crop in the bottom-left quadrant at full resolution (or -s 1024 1024 for half resolution)
+python create_movie.py ~/data/AIA/event_2012-08-31_1800_2012-08-31_2200/rgb_images -c 2048 2048 0 2048 -s 2048 2048
+```
+
+Additional options for `create_movie.py`:
+* `-c` / `--crop WIDTH HEIGHT X Y`: Crop window where `(X, Y)` is the top-left corner.
+* `-s` / `--frame-size WIDTH HEIGHT`: Output video resolution in pixels.
+* `-p` / `--padded-size WIDTH HEIGHT`: Optional padded frame size in pixels.
+* `--fps FPS`: Frames per second (default: `30`).
+* `--pattern PATTERN`: Glob pattern for input images (default: `"*.jpeg"`).
+* `-o` / `--output PATH`: Custom output movie path/filename (without `.mp4`).
+
+#### Option B: Creating movies in Python with `visualization.encode_video()`
+
+```python
 ##### Create .mp4 videos
 
-## full sun rescaled to 1080x1080 px
+## full sun rescaled to 1080x1080 px (or use (2048, 2048) for 1/2 resolution on 4K/5K screens)
 frame_size = (1080, 1080)
 filename = 'rgb_movie_full_sun_1080x1080'
 fps = 30  # Number of frames per second
 visualization.encode_video(aia_mixer.outputdir, filename, fps=fps, frame_size=frame_size)
-
 ```
 Video at: https://youtu.be/LivB3rEmXJQ (make sure you set the maximum resolution on the player)
 
@@ -111,31 +171,42 @@ Video at: https://youtu.be/LivB3rEmXJQ (make sure you set the maximum resolution
 Sometimes some media players work better if you provide videos with a 16:9 or 4:3 geometry. For the video above, we can instead get a padded version, where black stripes will be added on either side of our initial 1080x1080 picture frame to make it a 1920x1080 video. We would just add the extra ```padded_size``` parameter of (1920,1080):
 
 ```python
-    ## Rectangularly padded to fit 16:9 1920x1080p for optimized youtube streaming
-    padded_size = (1920, 1080)
-    visualization.encode_video(aia_mixer.outputdir, filename, fps=fps, frame_size=frame_size, padded_size=padded_size)
-
+## Rectangularly padded to fit 16:9 1920x1080p for optimized youtube streaming
+padded_size = (1920, 1080)
+visualization.encode_video(aia_mixer.outputdir, filename, fps=fps, frame_size=frame_size, padded_size=padded_size)
 ```
 Video at: https://youtu.be/XyqYKlLQZ8o (make sure you set the maximum resolution on the player)
 
 Having such 16:9 ratio usually enables your computer to decode and play the video more efficiently than a less "standard" geometry. 4:3 is also a standard geometry that plays nicely in modest computers and older softwares. Youtube players work best at 16:9. The file size is the same, as the padding only add zeros. 
 The file size of the above videos is ~5.5 MB. 
 
-Another example is if you want a close-up on the sun, so you can view a sub-field of the sun at higher resolution. Here, we crop a 3840x2160 section (which is a 16:9 geometry) off the 4096x4096 frame, and encode this again at 1920x1080, although we do not need to pad anything, we can exploit the full resolution of a typical display. 
+Another example is if you want a close-up on the sun, so you can view a sub-field of the sun at higher resolution. The `crop` argument takes `[width, height, x, y]`, where `x, y` are the top-left corner coordinates of the cropping window.
+
+Here, we crop a 3840x2160 section (which is a 16:9 geometry) around the bottom half of the 4096x4096 frame, and encode this at Full HD (1920x1080) or full 4K UHD resolution (3840x2160):
 
 ```python
-    image_pattern_search = "im_lab_0*.jpeg"
-    crop = [3840, 2160, 128, 1936]
-    frame_size = (1920, 1080)
-    movie_filename = 'rgb_movie_3840x2160_1920x1080'
-    fps = 30
-    # Encode movie
-    visualization.encode_video(aia_mixer.outputdir, movie_filename, crop=crop, frame_size=frame_size, image_pattern_search=image_pattern_search)
-
+image_pattern_search = f"{aia_mixer.filename_lab}_*.jpeg"
+crop = [3840, 2160, 128, 1936]  # [width, height, x, y]
+frame_size = (1920, 1080)       # or (3840, 2160) for full 4K resolution
+movie_filename = 'rgb_movie_3840x2160_1920x1080'
+fps = 30
+# Encode movie
+visualization.encode_video(aia_mixer.outputdir, movie_filename, fps=fps, crop=crop, frame_size=frame_size, image_pattern_search=image_pattern_search)
 ```
 Video at: https://youtu.be/CqIhzQMOLRw
 
 As we have more information in this 1920x1080 than above, the file size is a bit bigger, ~15 MB. Considering we had 225 images of ~4.1 MB, that would have resulted in nearly 1 GB of uncompressed video size for the full sun, for virtually no difference in how the images are rendedered on a typical full HD display!
+
+Similarly, you can crop a square region (e.g. a 2048x2048 window in the bottom-left quadrant) and output it at full resolution or half resolution:
+
+```python
+# Cropping over a 2048 x 2048 window in the bottom-left quadrant, at full resolution (or (1024, 1024) for half resolution)
+crop = [2048, 2048, 0, 2048]  # [width, height, x, y] where x, y are top-left corner of the cropping window
+frame_size = (2048, 2048)
+movie_filename = 'rgb_movie_crop_2048x2048_2048x2048'
+fps = 30
+visualization.encode_video(aia_mixer.outputdir, movie_filename, fps=fps, crop=crop, frame_size=frame_size)
+```
 
 
 
