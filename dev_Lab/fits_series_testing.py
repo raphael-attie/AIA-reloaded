@@ -35,13 +35,8 @@ rgbhigh = np.array([np.percentile(rgblist[0][j], percentiles_high[j]) for j in r
 
 scaled_rgblist = []
 for i in range(10):
-    im_rgb255, newmins, newmaxs = visualization.scale_rgb(rgblist[i], rgblow, rgbhigh, gamma_rgb=gamma_rgb, rgbmix=rgbmix)
+    im_rgb255 = visualization.scale_rgb(rgblist[i], rgblow, rgbhigh, gamma_rgb=gamma_rgb, rgbmix=rgbmix)
     scaled_rgblist.append(im_rgb255)
-    newdiffs = newmins - newmaxs
-    print(i)
-    print('%.2f , %.2f, %.2f' % (newmins[0], newmins[1], newmins[2]))
-    print('%.2f , %.2f, %.2f' % (newmaxs[0], newmaxs[1], newmaxs[2]))
-    print('%.2f , %.2f, %.2f' % (newdiffs[0], newdiffs[1], newdiffs[2]))
 
 
 print(rgblow)

@@ -36,26 +36,25 @@ class RGBMixer:
 
         self.data_dir = data_dir
 
-        if data_files is None:
-            if data_dir is not None and wavel_dirs is None:
-                raise ValueError('Missing input directory or files. Need either data_dir AND wavel_dirs, OR data_files')
+        if data_files is None and wavel_dirs is None:
+            raise ValueError('Missing input directory or files. Need either data_dir AND wavel_dirs, OR data_files')
 
         if wavel_dirs is not None:
             if data_dir is None:
                 self.wavel_dirs = wavel_dirs
             else:
-                self.wavel_dirs =  [os.path.join(data_dir, wavel) for wavel in wavel_dirs]
+                self.wavel_dirs = [os.path.join(data_dir, wavel) for wavel in wavel_dirs]
 
-        if os.path.isdir(outputdir):
+        if outputdir is not None and os.path.isdir(outputdir):
             self.outputdir = outputdir
         else:
             raise ValueError('output directory does not exist')
 
         if data_files is not None:
-            self.data_files=data_files
+            self.data_files = data_files
         else:
             if os.path.isdir(self.wavel_dirs[0]) and os.path.isdir(self.wavel_dirs[1]) and os.path.isdir(self.wavel_dirs[2]):
-                self.data_files = [glob.glob(os.path.join(ddir, '*.fits')) for ddir in self.wavel_dirs]
+                self.data_files = [sorted(glob.glob(os.path.join(ddir, '*.fits'))) for ddir in self.wavel_dirs]
             else:
                 raise ValueError('wavelength directories do not exist')
 
@@ -71,10 +70,8 @@ class RGBMixer:
         # Path and file naming scheme of the output images. This will be appended with the image number
         # for images processed in rgb space
         self.filename_rgb = filename_rgb
-        self.filepath_rgb = None
         # for images processed  in lab space
         self.filename_lab = filename_lab
-        self.filepath_lab = None
         # Intensity percentiles for linear scaling
         self.percentiles_low = (0, 0, 0)
         self.percentiles_high = (99.99, 99.99, 99.99)
@@ -91,10 +88,25 @@ class RGBMixer:
         # Reference rgb image used for the intensity scaling values
         self.ref_rgb = None
 
+    @property
+    def filepath_rgb(self):
+        if self.filename_rgb is not None and self.outputdir is not None:
+            return os.path.join(self.outputdir, self.filename_rgb)
+        return None
+
+    @property
+    def filepath_lab(self):
+        if self.filename_lab is not None and self.outputdir is not None:
+            return os.path.join(self.outputdir, self.filename_lab)
+        return None
+
     def set_aia_default(self):
 
         # Load and prep reference image
-        self.ref_rgb = [aiaprep(fitsfile) for fitsfile in self.ref_rgb_files]
+        if self.calibrate:
+            self.ref_rgb = [aiaprep(fitsfile) for fitsfile in self.ref_rgb_files]
+        else:
+            self.ref_rgb = [load_fits(fitsfile) for fitsfile in self.ref_rgb_files]
 
         self.percentiles_low = (25, 25, 25)
         self.percentiles_high = (99.5, 99.99, 99.85)
@@ -124,7 +136,8 @@ class RGBMixer:
         """Setup which image version to output. Can be either just rgb, just lab, or both"""
 
         bgr_stack1, bgr_stack2 = process_rgb_image(image_index, data_files=self.data_files,
-                                                   rgblow=self.rgblow, rgbhigh=self.rgbhigh, scalemin=self.scalemin,
+                                                   rgblow=self.rgblow, rgbhigh=self.rgbhigh,
+                                                   calibrate=self.calibrate, scalemin=self.scalemin,
                                                    gamma_rgb=self.gamma_rgb,
                                                    rgbmix=self.rgbmix,
                                                    lab=self.lab,
@@ -137,10 +150,10 @@ class RGBMixer:
     def process_rgb_list(self, ncores, file_range):
 
         if ncores > 1:
-            multiprocessing.set_start_method('spawn')
-            p = multiprocessing.Pool(ncores)
-            p.map(self.process_rgb, file_range)
-            p.close()
+            if multiprocessing.get_start_method(allow_none=True) != 'spawn':
+                multiprocessing.set_start_method('spawn', force=True)
+            with multiprocessing.Pool(ncores) as p:
+                p.map(self.process_rgb, file_range)
         else:
             for i in file_range:
                 _ = self.process_rgb(i)
@@ -221,7 +234,7 @@ def process_lab_32bit(bgr, lf=1, af=1, bf=1, lmin=0):
     :return: Numpy array of the rescaled "bgr" image. For visualization in Matplotlib, must swap again blue <-> red
     """
     # 32 bits needs to be scaled withi [0-1]
-    bgr2 = (bgr - bgr.min()) * 1 / (bgr.max() - bgr.min())
+    bgr2 = ((bgr - bgr.min()) * 1 / (bgr.max() - bgr.min())).astype(np.float32)
     lab = cv2.cvtColor(bgr2, cv2.COLOR_BGR2Lab)
     L, a, b = [lab[:, :, i] for i in range(3)]
     # In 32 bits, L ranges within [0 - 100]. In 8 bit: [0 255]
@@ -395,15 +408,12 @@ def load_fits(fitsfile):
     :return:
     """
     try:
-        hdul = fits.open(fitsfile)
+        with fits.open(fitsfile) as hdul:
+            if len(hdul) == 1:
+                data = hdul[0].data.astype(np.float64)
+            else:
+                hdul[1].verify('silentfix')
+                data = hdul[1].data.astype(np.float64)
+            return data
     except FileNotFoundError:
         print("Could not open fits file")
-    else:
-        if len(hdul) == 1:
-            data = hdul[0].data.astype(np.float64)
-        else:
-            hdul[1].verify('silentfix')
-            data = hdul[1].data.astype(np.float64)
-
-        hdul.close()
-        return data

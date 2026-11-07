@@ -26,11 +26,11 @@ def scale_rotate(image, angle=0, scale_factor=1, reference_pixel=None):
     # convert angle to radian
     angler = angle * np.pi / 180
     # Get basic rotation matrix to calculate initial padding extent
-    rmatrix = np.matrix([[np.cos(angler), -np.sin(angler)],
-                         [np.sin(angler), np.cos(angler)]])
+    rmatrix = np.array([[np.cos(angler), -np.sin(angler)],
+                        [np.sin(angler), np.cos(angler)]])
 
-    extent = np.max(np.abs(np.vstack((image.shape * rmatrix,
-                                      image.shape * rmatrix.T))), axis=0)
+    extent = np.max(np.abs(np.vstack((image.shape @ rmatrix,
+                                      image.shape @ rmatrix.T))), axis=0)
 
     # Calculate the needed padding or unpadding
     diff = np.asarray(np.ceil((extent - image.shape) / 2), dtype=int).ravel()
@@ -45,24 +45,28 @@ def scale_rotate(image, angle=0, scale_factor=1, reference_pixel=None):
     padded_array_center = (np.array(padded_image.shape)[::-1] - 1) / 2.0
 
     # Get scaled rotation matrix accounting for padding
-    rmatrix_cv = cv2.getRotationMatrix2D((padded_reference_pixel[0], padded_reference_pixel[1]), angle, scale_factor)
+    rmatrix_cv = cv2.getRotationMatrix2D(
+        (float(padded_reference_pixel[0]), float(padded_reference_pixel[1])),
+        float(angle),
+        float(scale_factor)
+    )
     # Adding extra shift to recenter:
     # move image so the reference pixel aligns with the center of the padded array
     shift = padded_array_center - padded_reference_pixel
     rmatrix_cv[0, 2] += shift[0]
     rmatrix_cv[1, 2] += shift[1]
     # Do the scaled rotation with opencv. ~20x faster than Sunpy's map.rotate()
-    rotated_image = cv2.warpAffine(padded_image, rmatrix_cv, padded_image.shape, cv2.INTER_CUBIC)
+    rotated_image = cv2.warpAffine(padded_image, rmatrix_cv, padded_image.shape[::-1], cv2.INTER_CUBIC)
 
     return rotated_image
 
 
 def aiaprep(fitsfile, cropsize=aia_image_size):
 
-    hdul = fits.open(fitsfile)
-    hdul[1].verify('silentfix')
-    header = hdul[1].header
-    data = hdul[1].data.astype(np.float64)
+    with fits.open(fitsfile) as hdul:
+        hdul[1].verify('silentfix')
+        header = hdul[1].header
+        data = hdul[1].data.astype(np.float64)
     data /= header['EXPTIME']
     # Target scale is 0.6 arcsec/px
     target_scale = 0.6

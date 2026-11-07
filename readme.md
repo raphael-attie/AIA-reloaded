@@ -66,8 +66,7 @@ typically, beamers in conferences are at best at "full HD", i.e 1920x1080. That 
 We also provide options to create videos and crop within the full resolution images for close-ups. Nonetheless, even a full resolution jpeg image size is 4.1 MB. if you do not want or do not need to retain the full resolution images and prefer to directly crop them before creating the image series, you can ask for cropped image directly when instantiating the RGBMixer class. For example, to only retain the bottom half of the sun one would add the following optional crop parameter:
 
 ```python
-aia_mixer.crop = (slice(0,2048), slice(2048,4095)) # the first slice is over
-
+aia_mixer.crop = (slice(0, 4096), slice(2048, 4096)) # (x, y) = (cols, rows) slices
 ```
 
 To create movies, you'll process multiple rgb images from a list of raw fits files. Instead of ```aia_mixer.process_rgb(0)``` you would use ```aia_mixer.process_rgb_list(ncores, file_range)``` where e.g: ```file_range = range(200)``` to process images, and ```ncores = 4``` to parralelize over 4 workers. 

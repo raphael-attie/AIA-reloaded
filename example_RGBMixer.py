@@ -5,13 +5,14 @@ from visualization import RGBMixer
 # This example provides the data file paths and output directory
 
 aia_mixer = RGBMixer(
-    data_files = [glob.glob('../aia_data/*.%s*.fits'%wavel) for wavel in ['304', '171', '193']],
-    outputdir = os.path.abspath('../aia_data/'))
+    data_files = [glob.glob('samples/*.%s*.fits'%wavel) for wavel in ['304', '171', '193']],
+    outputdir = os.path.abspath('samples/'))
 aia_mixer.set_aia_default()
 
-# Example of cropping. Combined with the extra 2x downsampled version of the RGBMixer, this will create also images in
+# Example of cropping in (x, y) = (cols, rows) coordinates.
+# Combined with the extra 2x downsampled version of the RGBMixer, this will create also images in
 # full HD (1920x1080) that do not need require ffmpeg to apply a lossy, blurring rescaling.
-aia_mixer.crop = (slice(1935,1935+2160), slice(128,128+3840))
+aia_mixer.crop = (slice(128, 128+3840), slice(1935, 1935+2160))
 
 aia_mixer.filename_lab = 'im_crop_lab'
 

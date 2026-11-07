@@ -28,30 +28,33 @@ def test_scale_rotate_4096x4096_random_data():
     assert edge_sum == 0
 
 
+SAMPLES_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'samples'))
+
+
 def test_file_exist():
-    assert len(glob.glob('../aia_data/*.fits')) > 0, "the list is empty"
+    assert len(glob.glob(os.path.join(SAMPLES_DIR, '*.fits'))) > 0, "the list is empty"
 
 
 def test_rgb_files_exist():
-    assert len(glob.glob('../aia_data/*304*.fits')) > 0 and \
-           len(glob.glob('../aia_data/*193*.fits')) > 0 and \
-           len(glob.glob('../aia_data/*171*.fits')) > 0
+    assert len(glob.glob(os.path.join(SAMPLES_DIR, '*304*.fits'))) > 0 and \
+           len(glob.glob(os.path.join(SAMPLES_DIR, '*193*.fits'))) > 0 and \
+           len(glob.glob(os.path.join(SAMPLES_DIR, '*171*.fits'))) > 0
 
 
 def test_aiaprep():
-    fitsfile = glob.glob('../aia_data/*.fits')[0]
+    fitsfile = glob.glob(os.path.join(SAMPLES_DIR, '*.fits'))[0]
     _ = aiaprep(fitsfile)
 
 
 def test_aiaprep_crop_4096():
-    fitsfile = glob.glob('../aia_data/*.fits')[0]
+    fitsfile = glob.glob(os.path.join(SAMPLES_DIR, '*.fits'))[0]
     _ = aiaprep(fitsfile, cropsize=4096)
 
 
 
 def setup_function(test_aia_rgb_sample):
 
-    for file in glob.glob('../aia_data/*.jpeg'):
+    for file in glob.glob(os.path.join(SAMPLES_DIR, '*.jpeg')):
         if os.path.exists(file):
             os.remove(file)
 
@@ -59,8 +62,8 @@ def setup_function(test_aia_rgb_sample):
 def test_aia_rgb_sample():
 
     aia_mixer = RGBMixer(
-        data_files=[glob.glob('../aia_data/*.%s*.fits' % wavel) for wavel in ['304', '171', '193']],
-        outputdir=os.path.abspath('../aia_data/rgb/'))
+        data_files=[glob.glob(os.path.join(SAMPLES_DIR, '*.%s*.fits' % wavel)) for wavel in ['304', '171', '193']],
+        outputdir=SAMPLES_DIR)
     aia_mixer.set_aia_default()
 
     _ = aia_mixer.process_rgb(0)
@@ -68,6 +71,23 @@ def test_aia_rgb_sample():
     outputfile_lab = aia_mixer.filepath_lab + '_%04d.jpeg' % 0
 
     assert os.path.isfile(outputfile_lab)
+
+
+def test_aia_rgb_crop_xy():
+    aia_mixer = RGBMixer(
+        data_files=[glob.glob(os.path.join(SAMPLES_DIR, '*.%s*.fits' % wavel)) for wavel in ['304', '171', '193']],
+        outputdir=SAMPLES_DIR)
+    aia_mixer.set_aia_default()
+    # (x, y) = (cols, rows) -> 3840 wide by 2160 high (16:9)
+    aia_mixer.crop = (slice(128, 128 + 3840), slice(1935, 1935 + 2160))
+    aia_mixer.filename_lab = 'im_crop_lab'
+
+    bgr1, bgr2 = aia_mixer.process_rgb(0)
+
+    # numpy image array shape is (height/rows, width/cols, channels)
+    assert bgr1.shape == (2160, 3840, 3)
+    assert bgr2.shape == (2160, 3840, 3)
+    assert os.path.isfile(aia_mixer.filepath_lab + '_%04d.jpeg' % 0)
 
 
 

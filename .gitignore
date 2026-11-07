@@ -4,6 +4,8 @@
 # pyCharm specific
 .pytest_cache/
 __pycache__/
+.venv/
+.DS_Store
 readme.md
 
 # User-specific stuff
