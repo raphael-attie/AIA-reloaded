@@ -1774,8 +1774,8 @@ def create_dash_app(store: "FrameStore") -> Dash:
                                         style={"fontSize": "12px", "fontWeight": "700", "color": "#e5e5e5", "marginBottom": "4px"},
                                     ),
                                     _slider_row(
-                                        "Structure (MGN weight; 0 = off)", "structure", 0.0, 1.0, 0.01, 0.0,
-                                        {0: "0", 0.25: "0.25", 0.5: "0.5", 0.75: "0.75", 1: "1"}, GRAY_TRACK, "#d4d4d4",
+                                        "Structure (MGN weight; 0 = off)", "structure", 0.0, 0.2, 0.002, 0.0,
+                                        {0: "0", 0.05: "0.05", 0.1: "0.1", 0.15: "0.15", 0.2: "0.2"}, GRAY_TRACK, "#d4d4d4",
                                     ),
                                     html.Div(
                                         "Sharpening — unsharp mask",
@@ -2332,7 +2332,7 @@ def create_dash_app(store: "FrameStore") -> Dash:
             f"self.gamma_rgb = ({gamma:.2f}, {gamma:.2f}, {gamma:.2f})\n"
             f"self.contrast = {contrast:.1f}\n"
             f"self.contrast_mid = ({', '.join(f'{v:.4f}' for v in data.contrast_mid(gamma, contrast))})\n"
-            f"self.structure = {tp.structure:.2f}\n"
+            f"self.structure = {tp.structure:.3f}\n"
             f"self.sharpen = ({tp.amount:.2f}, {tp.radius:.1f}, {tp.detail:.0f}, {tp.masking:.0f})  # amount, radius, detail, masking"
         )
         hidden = [f"{w} Å" for w, v in zip(data.triplet, visible) if w and not v]
@@ -2542,7 +2542,7 @@ def create_dash_app(store: "FrameStore") -> Dash:
     )
     def update_enhance_labels(structure, amount, radius, detail, masking):
         return (
-            f"{float(structure or 0):.2f}" if structure else "off",
+            f"{float(structure or 0):.3f}" if structure else "off",
             f"{float(amount or 0):.2f}" if amount else "off",
             f"{float(radius or 1):.1f} px",
             f"{float(detail or 0):.0f}%",
@@ -2724,7 +2724,7 @@ def create_dash_app(store: "FrameStore") -> Dash:
         hidden = "".join(f"_hide{w}" for w, v in zip(triplet, visible) if w and not v)
         stem = f"im_custom_lch_jp2_{'_'.join(w or 'none' for w in triplet)}{hidden}_gamma{gamma:.2f}_contrast{contrast:.1f}"
         if tp.structure > 1e-6:
-            stem += f"_mgn{tp.structure:.2f}"
+            stem += f"_mgn{tp.structure:.3f}"
         if tp.amount > 1e-6:
             stem += f"_sharp{tp.amount:.2f}-r{tp.radius:.1f}-d{tp.detail:.0f}-m{tp.masking:.0f}"
         suffix = src.frame_times[frame] if src.is_event else "0000"
