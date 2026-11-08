@@ -271,6 +271,25 @@ MGN_SIGMAS = (1.25, 2.5, 5.0, 10.0, 20.0, 40.0)  # Gaussian scales in full-resol
 MGN_K = 0.7
 
 
+MGN_BLUR_MIN_SIGMA = 4.0  # wide blurs run on an image downsampled so that sigma stays >= this many pixels
+
+
+def _gaussian_local_mean(img, sigma):
+    """Gaussian blur of a float32 image. Wide kernels (sigma >= 2 * MGN_BLUR_MIN_SIGMA) are computed on an
+    area-downsampled copy (factor 2^n, at most 8) and bilinearly upsampled: the blur suppresses the detail the
+    resampling loses, so the result matches the full-resolution blur closely at a fraction of the cost
+    (direct sigma = 40 px blurs on 4096^2 images dominate MGN otherwise)."""
+    f = 1
+    while f < 8 and sigma / (2 * f) >= MGN_BLUR_MIN_SIGMA:
+        f *= 2
+    if f == 1:
+        return cv2.GaussianBlur(img, (0, 0), sigma)
+    h, w = img.shape
+    small = cv2.resize(img, (max(1, w // f), max(1, h // f)), interpolation=cv2.INTER_AREA)
+    small = cv2.GaussianBlur(small, (0, 0), sigma / f)
+    return cv2.resize(small, (w, h), interpolation=cv2.INTER_LINEAR)
+
+
 def mgn_detail(x, scale=1.0, sigmas=MGN_SIGMAS, k=MGN_K):
     """
     Local component of Multi-scale Gaussian Normalization (Morgan & Druckmueller 2014, Solar Phys. 289, 2945).
@@ -291,9 +310,9 @@ def mgn_detail(x, scale=1.0, sigmas=MGN_SIGMAS, k=MGN_K):
         sig = s * scale
         if sig < 0.5:
             continue
-        mean = cv2.GaussianBlur(x, (0, 0), sig)
+        mean = _gaussian_local_mean(x, sig)
         d = x - mean
-        sd = np.sqrt(cv2.GaussianBlur(d * d, (0, 0), sig))
+        sd = np.sqrt(_gaussian_local_mean(d * d, sig))
         acc += np.arctan(np.float32(k) * d / np.maximum(sd, np.float32(1e-3)))
         n += 1
     return acc / np.float32(max(n, 1) * np.pi / 2)

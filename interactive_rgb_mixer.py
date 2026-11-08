@@ -25,15 +25,17 @@ import glob
 import json
 import re
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from collections import OrderedDict
 from typing import NamedTuple
 import os
 import time
 import cv2
 import numpy as np
-from dash import Dash, Input, Output, State, ctx, dcc, html, no_update
+from dash import ALL, Dash, Input, Output, State, ctx, dcc, html, no_update
 
 import visualization
+import create_movie
 
 # sunpy's standard SDO/AIA colormaps (sunpy.visualization.colormaps; needs `sunpy[visualization]`).
 from sunpy.visualization import colormaps as sunpy_cm
@@ -502,6 +504,41 @@ def parse_preset(obj: dict) -> tuple[list[dict[str, float]], tuple[float, float,
     return anchor, (gh, gc, gl)
 
 
+# -----------------------------------------------------------------------------
+# Settings cache: every settings change (colors, channels, eye toggles, tone, sharpening, region) is written
+# to <project>/cache/last_settings.json, so "Load Cached Settings" restores the latest state after a restart.
+# The file is a preset (same format) with an extra "settings" block, so Load Preset… also reads it.
+# -----------------------------------------------------------------------------
+CACHE_DIR = os.path.join(PROJECT_DIR, "cache")
+CACHE_FILE = os.path.join(CACHE_DIR, "last_settings.json")
+
+
+_CACHE_LOCK = threading.Lock()  # callbacks run concurrently; one writer at a time
+
+
+def write_settings_cache(anchor_wb, wb_lch, gh, gc, gl, triplet, tp, visible, region: str) -> None:
+    rgbmix = lch_to_rgbmix(wb_lch)
+    data = build_preset(anchor_wb, wb_lch, gh, gc, gl, triplet, rgbmix)
+    data["settings"] = {
+        "channels_rgb": [w or EMPTY_SLOT for w in triplet],
+        "visible_rgb": [bool(v) for v in np.ravel(visible)],
+        "gamma": tp.gamma,
+        "contrast": tp.contrast,
+        "structure": tp.structure,
+        "sharpen_amount": tp.amount,
+        "sharpen_radius": tp.radius,
+        "sharpen_detail": tp.detail,
+        "sharpen_masking": tp.masking,
+        "region": region,
+    }
+    with _CACHE_LOCK:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        tmp = CACHE_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp, CACHE_FILE)  # never leave a half-written cache behind
+
+
 def generate_color_wheel_uri(size: int = 148) -> str:
     """Generate a smooth perceptual Oklch color wheel using the exact same vivid Hue mapping."""
     yy, xx = np.mgrid[0:size, 0:size]
@@ -601,22 +638,101 @@ def sunpy_lut_bgr_u8(cmap_name: str) -> np.ndarray:
 COLOR_WHEEL_URI = generate_color_wheel_uri(148)
 
 
-VIEW_NAMES = ["full_1024", "full_1536", "crop_bottom_half", "zoom_prominence", "zoom_active_region"]
+# Selectable regions of the 4096x4096 frame. The key is also the name of the region's output sub-folder.
+# Value: (label, crop (width, height, x, y) in full-resolution pixels or None for the whole disk, icon spec).
+# Rows grow downward as displayed. Quadrants are numbered counter-clockwise from the top-right (Q1), as in
+# mathematics. One definition drives the previews, the spatial filter scales, the saved images and the movie.
+FULL_RES = 4096
+_H = FULL_RES // 2
+REGIONS = OrderedDict([
+    ("full-disk", ("Full disk", None, ("disk",))),
+    ("Q1", ("Q1 — top-right quadrant", (_H, _H, _H, 0), ("wedge", 1, -1))),
+    ("Q2", ("Q2 — top-left quadrant", (_H, _H, 0, 0), ("wedge", -1, -1))),
+    ("Q3", ("Q3 — bottom-left quadrant", (_H, _H, 0, _H), ("wedge", -1, 1))),
+    ("Q4", ("Q4 — bottom-right quadrant", (_H, _H, _H, _H), ("wedge", 1, 1))),
+    ("Rtop", ("Top half", (FULL_RES, _H, 0, 0), ("half", 2, 2, 22, 11))),
+    ("Rbot", ("Bottom half", (FULL_RES, _H, 0, _H), ("half", 2, 13, 22, 11))),
+    ("Rleft", ("Left half", (_H, FULL_RES, 0, 0), ("half", 2, 2, 11, 22))),
+    ("Rright", ("Right half", (_H, FULL_RES, _H, 0), ("half", 13, 2, 11, 22))),
+])
+VIEW_NAMES = list(REGIONS)
+DEFAULT_VIEW = "full-disk"
+MOVIE_LONG_SIDE = 1024  # previews and batch movies: longest side 1024 px, aspect ratio kept (no padding)
+
+
+def region_size(view_name: str) -> tuple[int, int]:
+    crop = REGIONS[view_name][1]
+    return (crop[0], crop[1]) if crop else (FULL_RES, FULL_RES)
+
+
+def region_out_size(view_name: str) -> tuple[int, int]:
+    """Preview / movie size: the region scaled to MOVIE_LONG_SIDE on its longest side (even numbers, as
+    yuv420p requires): full disk and quadrants 1024x1024, top/bottom halves 1024x512, left/right 512x1024."""
+    w, h = region_size(view_name)
+    f = MOVIE_LONG_SIDE / max(w, h)
+    return 2 * round(w * f / 2), 2 * round(h * f / 2)
+
+
+REGION_MARGIN = 192  # full-res px processed around a region crop so MGN / sharpening match the full frame there
+
+
+def region_slices(view_name: str) -> tuple[tuple[slice, slice], tuple[slice, slice]]:
+    """(slices of the region plus a REGION_MARGIN border in the full frame, slices of the region within that).
+    Processing the padded crop and trimming it gives the same pixels as processing the whole frame (MGN's
+    widest Gaussian, sigma = 40 px, decays well within the margin) at a fraction of the cost."""
+    crop = REGIONS.get(view_name, REGIONS[DEFAULT_VIEW])[1]
+    if crop is None:
+        full = (slice(0, None), slice(0, None))
+        return full, full
+    w, h, x, y = crop
+    y0, x0 = max(0, y - REGION_MARGIN), max(0, x - REGION_MARGIN)
+    y1, x1 = min(FULL_RES, y + h + REGION_MARGIN), min(FULL_RES, x + w + REGION_MARGIN)
+    return (slice(y0, y1), slice(x0, x1)), (slice(y - y0, y - y0 + h), slice(x - x0, x - x0 + w))
 
 
 def _make_views(full: np.ndarray) -> dict[str, np.ndarray]:
-    """Preview views of one full-resolution 4096x4096 image (2D) or stack (3D)."""
-    h, w = full.shape[:2]
+    """Preview views of one full-resolution 4096x4096 image (2D) or stack (3D): every region, area-resampled
+    to its preview size."""
+    views = {}
+    for name, (_, crop, _) in REGIONS.items():
+        part = full if crop is None else full[crop[3] : crop[3] + crop[1], crop[2] : crop[2] + crop[0]]
+        views[name] = cv2.resize(part, region_out_size(name), interpolation=cv2.INTER_AREA)
+    return views
+
+
+def _region_icon_uri(icon: tuple) -> str:
+    """Small SVG icon: filled disk (full disk), filled quarter-disk wedge (quadrants), or a square with the
+    selected half filled (halves)."""
+    fill, line = "#d4d4d4", "#737373"
+    c, r = 13, 11
+    if icon[0] == "disk":
+        body = f'<circle cx="{c}" cy="{c}" r="{r}" fill="{fill}"/>'
+    elif icon[0] == "wedge":
+        # wedge from the disk center toward the quadrant's corner
+        _, sx, sy = icon
+        p1, p2 = (c + sx * r, c), (c, c + sy * r)
+        sweep = 1 if sx * sy > 0 else 0  # bulge outward, away from the disk center
+        body = (f'<circle cx="{c}" cy="{c}" r="{r}" fill="none" stroke="{line}" stroke-width="1.2"/>'
+                f'<path d="M{c},{c} L{p1[0]},{p1[1]} A{r},{r} 0 0 {sweep} {p2[0]},{p2[1]} Z" fill="{fill}"/>')
+    else:
+        _, x, y, w, h = icon
+        body = (f'<rect x="2" y="2" width="22" height="22" fill="none" stroke="{line}" stroke-width="1.2"/>'
+                f'<rect x="{x}" y="{y}" width="{w}" height="{h}" fill="{fill}"/>')
+    svg = f'<svg xmlns="http://www.w3.org/2000/svg" width="26" height="26" viewBox="0 0 26 26">{body}</svg>'
+    return "data:image/svg+xml;base64," + base64.b64encode(svg.encode()).decode("ascii")
+
+
+REGION_ICON_URIS = {name: _region_icon_uri(icon) for name, (_, _, icon) in REGIONS.items()}
+
+
+def region_btn_style(selected: bool) -> dict:
     return {
-        "full_1024": cv2.resize(full, (1024, 1024), interpolation=cv2.INTER_AREA),
-        "full_1536": cv2.resize(full, (1536, 1536), interpolation=cv2.INTER_AREA),
-        "crop_bottom_half": cv2.resize(
-            full[1935 : min(h, 1935 + 2160), 128 : min(w, 128 + 3840)],
-            (1280, 720),
-            interpolation=cv2.INTER_AREA,
-        ),
-        "zoom_prominence": full[2300:3324, 200:1224].copy(),
-        "zoom_active_region": full[1050:2074, 2800:3824].copy(),
+        "backgroundColor": "#2a2a2a" if selected else "#000000",
+        "border": f"1px solid {'#e5e5e5' if selected else '#3a3a3a'}",
+        "borderRadius": "6px",
+        "padding": "3px",
+        "cursor": "pointer",
+        "lineHeight": "0",
     }
 
 
@@ -631,13 +747,7 @@ def _encode_uri(bgr_u8: np.ndarray, jpeg_quality: int = 92) -> str:
 
 # Image pixels per full-resolution (4096 px) pixel for each preview view, so spatial filters (sharpening
 # radius, MGN scales) act on the same physical sizes in previews as in the full-resolution output.
-VIEW_SCALE = {
-    "full_1024": 1024 / 4096,
-    "full_1536": 1536 / 4096,
-    "crop_bottom_half": 1280 / 3840,
-    "zoom_prominence": 1.0,
-    "zoom_active_region": 1.0,
-}
+VIEW_SCALE = {name: region_out_size(name)[0] / region_size(name)[0] for name in REGIONS}
 
 
 class ToneParams(NamedTuple):
@@ -680,7 +790,7 @@ class TripletData:
             for view_name in VIEW_NAMES
         }
 
-        self._preview = self.views["full_1024"].astype(np.float64)
+        self._preview = self.views[DEFAULT_VIEW].astype(np.float64)
         self._mask = np.max(self._preview, axis=-1) > 0.05
         self.disk_pixels = self._preview[self._mask]
         # Small fixed subsample for per-callback diagnostics (dominant hue, cast, clipping).
@@ -789,7 +899,7 @@ class TripletData:
         colorbar. Spatial filters need neighbors, so they are taken from the processed full-sun view."""
         if not tp.spatial:
             return self.tone(self.sample_pixels, tp.gamma, tp.contrast), self.tone(self.track_pixels, tp.gamma, tp.contrast)
-        sample = self.tone_view("full_1024", tp).astype(np.float64)[self._mask][:: self._stride]
+        sample = self.tone_view(DEFAULT_VIEW, tp).astype(np.float64)[self._mask][:: self._stride]
         return sample, sample[::4]
 
     def presets_for(self, tp: ToneParams) -> dict[str, dict]:
@@ -797,7 +907,7 @@ class TripletData:
         key = tp.key()
         if key not in self._presets:
             if tp.spatial:
-                preview = self.tone_view("full_1024", tp).astype(np.float64)
+                preview = self.tone_view(DEFAULT_VIEW, tp).astype(np.float64)
             else:
                 preview = self.tone(self._preview, tp.gamma, tp.contrast)
             self._presets[key] = compute_auto_balance_presets(preview[self._mask])
@@ -928,7 +1038,7 @@ def event_source(event_dir: str) -> DataSource | None:
         return None
     name = os.path.basename(os.path.normpath(event_dir))
     label = f"{name}  ({', '.join(files_by_wavel)} Å · {len(times)} frames)"
-    return DataSource(name, label, files_by_wavel, times, os.path.join(event_dir, "mixer_exports"), is_event=True)
+    return DataSource(name, label, files_by_wavel, times, os.path.join(event_dir, "rgb_images"), is_event=True)
 
 
 def discover_sources(samples_dir: str, data_dir: str | None) -> "OrderedDict[str, DataSource]":
@@ -1344,6 +1454,7 @@ def create_dash_app(store: "FrameStore") -> Dash:
         },
         children=[
             # Single authoritative store holding anchor_wb and last_synced_wb
+            dcc.Store(id="cache-load-store"),  # color part of a loaded cache, consumed by master_update
             dcc.Store(
                 id="mixer-state-store",
                 data={
@@ -1394,9 +1505,25 @@ def create_dash_app(store: "FrameStore") -> Dash:
                                 },
                             ),
                             html.Button(
+                                "Load Cached Settings",
+                                id="btn-load-cache",
+                                title="Restore the latest settings (colors, channels, eye toggles, tone, sharpening, region), e.g. after restarting the app (cache/last_settings.json)",
+                                n_clicks=0,
+                                style={
+                                    "backgroundColor": "#2a2a2a",
+                                    "color": "#fafafa",
+                                    "border": "1px solid #525252",
+                                    "borderRadius": "6px",
+                                    "padding": "8px 14px",
+                                    "cursor": "pointer",
+                                    "fontWeight": "600",
+                                    "fontSize": "12px",
+                                },
+                            ),
+                            html.Button(
                                 "Save Full-Res JPEG",
                                 id="btn-save-full",
-                                title="Save the current frame at full resolution: samples/ for the samples, <event>/mixer_exports/ for an event",
+                                title="Save the current frame at full resolution: samples/ for the samples, <event>/rgb_images/ for an event",
                                 n_clicks=0,
                                 style={
                                     "backgroundColor": "#0284c7",
@@ -1409,9 +1536,30 @@ def create_dash_app(store: "FrameStore") -> Dash:
                                     "fontSize": "12px",
                                 },
                             ),
+                            html.Button(
+                                "Save Batch",
+                                id="btn-save-batch",
+                                title="Render every frame of the event with the current settings into <event>/rgb_images/<sharpening>/, then encode an MP4 (create_movie.py) in the event folder",
+                                n_clicks=0,
+                                style={
+                                    "backgroundColor": "#0284c7",
+                                    "color": "#ffffff",
+                                    "border": "none",
+                                    "borderRadius": "6px",
+                                    "padding": "8px 14px",
+                                    "cursor": "pointer",
+                                    "fontWeight": "600",
+                                    "fontSize": "12px",
+                                },
+                            ),
+                            dcc.Interval(id="batch-poll", interval=1000, disabled=True),
                         ],
                     ),
                 ],
+            ),
+            html.Div(
+                id="batch-status",
+                style={"fontSize": "12px", "color": "#38bdf8", "textAlign": "right", "minHeight": "16px", "margin": "-8px 0 8px"},
             ),
             # Main 2-Column Content Area
             html.Div(
@@ -1765,8 +1913,8 @@ def create_dash_app(store: "FrameStore") -> Dash:
                                     ),
                                     html.Div(
                                         "Applied to each input channel after the Tone Curve, before mixing (so the mix gets no color fringes). "
-                                        "Radii are in full-resolution pixels: fine sharpening is best judged in the 1:1 zoom views, since "
-                                        "full-sun previews are downsampled 2.7–4×.",
+                                        "Radii are in full-resolution pixels: fine sharpening is best judged on a quadrant (2× downsampled), since "
+                                        "the full-disk and half previews are downsampled 4×.",
                                         style={"fontSize": "11px", "color": "#d4d4d4", "marginBottom": "10px"},
                                     ),
                                     html.Div(
@@ -1868,19 +2016,20 @@ def create_dash_app(store: "FrameStore") -> Dash:
                                     html.Div(
                                         style={"display": "flex", "alignItems": "center", "gap": "10px"},
                                         children=[
-                                            html.Span("Region / Resolution:", style={"fontSize": "13px", "fontWeight": "600", "color": "#e5e5e5"}),
-                                            dcc.Dropdown(
-                                                id="view-select",
-                                                options=[
-                                                    {"label": "Full Sun (1024×1024 Fast Preview)", "value": "full_1024"},
-                                                    {"label": "Full Sun (1536×1536 High-Res Preview)", "value": "full_1536"},
-                                                    {"label": "Bottom Half 16:9 Crop (Prominence + Corona)", "value": "crop_bottom_half"},
-                                                    {"label": "1:1 Native Zoom — Erupting Prominence (304 Å)", "value": "zoom_prominence"},
-                                                    {"label": "1:1 Native Zoom — Active Region Loops (171/193 Å)", "value": "zoom_active_region"},
+                                            html.Span("Region:", style={"fontSize": "13px", "fontWeight": "600", "color": "#e5e5e5"}),
+                                            dcc.Store(id="view-select", data=DEFAULT_VIEW),
+                                            html.Div(
+                                                style={"display": "flex", "gap": "4px", "flexWrap": "wrap"},
+                                                children=[
+                                                    html.Button(
+                                                        html.Img(src=REGION_ICON_URIS[name], style={"width": "22px", "height": "22px", "display": "block"}),
+                                                        id={"type": "region-btn", "region": name},
+                                                        n_clicks=0,
+                                                        title=f"{label} — saved to <settings>/{name}/; preview & movie {'×'.join(map(str, region_out_size(name)))}",
+                                                        style=region_btn_style(name == DEFAULT_VIEW),
+                                                    )
+                                                    for name, (label, _, _) in REGIONS.items()
                                                 ],
-                                                value="full_1024",
-                                                clearable=False,
-                                                style={"width": "340px", "fontSize": "13px", "color": "#e5e5e5"},
                                             ),
                                         ],
                                     ),
@@ -2033,7 +2182,7 @@ def create_dash_app(store: "FrameStore") -> Dash:
                                                                 children=[
                                                                     html.Img(
                                                                         id=f"img-channel-{k}",
-                                                                        src=init_cache.channel_uri(init_triplet[k], "full_1024") if init_triplet[k] else EMPTY_CHANNEL_URI,
+                                                                        src=init_cache.channel_uri(init_triplet[k], DEFAULT_VIEW) if init_triplet[k] else EMPTY_CHANNEL_URI,
                                                                         style={"width": "100%", "objectFit": "contain", "borderRadius": "4px", "display": "block"},
                                                                     ),
                                                                     html.Button(
@@ -2159,7 +2308,8 @@ def create_dash_app(store: "FrameStore") -> Dash:
         Input("btn-auto-warm-cool", "n_clicks"),
         Input("btn-auto-white-patch", "n_clicks"),
         Input("preset-upload", "contents"),
-        Input("view-select", "value"),
+        Input("cache-load-store", "data"),
+        Input("view-select", "data"),
         Input("compare-mode", "value"),
         Input("ch-select-0", "value"),
         Input("ch-select-1", "value"),
@@ -2193,6 +2343,7 @@ def create_dash_app(store: "FrameStore") -> Dash:
         _n_wc,
         _n_wp,
         upload_contents,
+        cache_load,
         view_name,
         compare_mode,
         ch0,
@@ -2215,6 +2366,9 @@ def create_dash_app(store: "FrameStore") -> Dash:
     ):
         t0 = time.perf_counter()
         trigger = ctx.triggered_id
+        # Loading the cache changes channels/tone/sharpening in the same update; the cache wins as trigger.
+        if "cache-load-store.data" in ctx.triggered_prop_ids:
+            trigger = "cache-load-store"
         try:
             data = store.get(source_name, frame).get((ch0, ch1, ch2))
         except ValueError:  # every slot empty: nothing to mix
@@ -2253,7 +2407,20 @@ def create_dash_app(store: "FrameStore") -> Dash:
         clear_upload = no_update
 
         loaded = None
-        if trigger == "preset-upload" and upload_contents:
+        loaded_wb = None  # exact Option 2 values to restore (cache); presets rebuild them from anchor + global
+        loaded_from = upload_filename
+        if trigger == "cache-load-store" and cache_load:
+            try:
+                loaded = parse_preset(cache_load["preset"])
+                loaded_wb = [
+                    {"H": float(w["H"]) % 360.0, "C": float(np.clip(float(w["C"]), WB_C_MIN, WB_C_MAX)),
+                     "L": float(np.clip(float(w["L"]), WB_L_MIN, WB_L_MAX))}
+                    for w in cache_load["preset"]["option2_wavebands"]
+                ]
+                loaded_from = os.path.relpath(CACHE_FILE, PROJECT_DIR)
+            except (ValueError, KeyError, TypeError) as exc:
+                desc_out = f"Could not load cached settings: {exc}"
+        elif trigger == "preset-upload" and upload_contents:
             clear_upload = None  # so loading the same file again re-triggers
             try:
                 _, b64 = upload_contents.split(",", 1)
@@ -2263,11 +2430,11 @@ def create_dash_app(store: "FrameStore") -> Dash:
 
         if loaded is not None:
             anchor_wb, (gh, gc, gl) = loaded
-            wb_lch = apply_global_to_anchor(anchor_wb, gh, gc, gl)
+            wb_lch = loaded_wb or apply_global_to_anchor(anchor_wb, gh, gc, gl)
             last_synced_wb = copy.deepcopy(wb_lch)
             update_wb_sliders = True
             update_global_sliders = True
-            desc_out = f"Loaded preset '{upload_filename}' (Option 1 & Option 2 sliders)."
+            desc_out = f"Loaded preset '{loaded_from}' (Option 1 & Option 2 sliders)."
         elif trigger in preset_map:
             preset = data.presets_for(tp)[preset_map[trigger]]
             anchor_wb = apply_global_to_anchor(preset["wb_lch"], 0.0, 1.0, 1.0)
@@ -2306,6 +2473,11 @@ def create_dash_app(store: "FrameStore") -> Dash:
         visible = visibility_mask(eye0, eye1, eye2)
         shown_mix = rgbmix * visible
         mod_uri = data.render_uri(view_name, shown_mix, tp)
+        if ctx.triggered_id is not None:  # skip the page-load call: it would overwrite the cache with defaults
+            write_settings_cache(
+                anchor_wb, wb_lch, float(gh), float(gc), float(gl), tuple(norm_wavel(w) for w in (ch0, ch1, ch2)),
+                tp, visible, view_name,
+            )
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
 
         base_mod_style = {}
@@ -2462,7 +2634,7 @@ def create_dash_app(store: "FrameStore") -> Dash:
 
     @app.callback(
         *channel_outputs,
-        Input("view-select", "value"),
+        Input("view-select", "data"),
         Input("ch-select-0", "value"),
         Input("ch-select-1", "value"),
         Input("ch-select-2", "value"),
@@ -2611,6 +2783,17 @@ def create_dash_app(store: "FrameStore") -> Dash:
             json.dump(preset, f, indent=2)
         return f"Saved preset to {os.path.relpath(path, PROJECT_DIR)}"
 
+    @app.callback(
+        Output("view-select", "data"),
+        Output({"type": "region-btn", "region": ALL}, "style"),
+        Input({"type": "region-btn", "region": ALL}, "n_clicks"),
+        State("view-select", "data"),
+        prevent_initial_call=True,
+    )
+    def select_region(_clicks, current):
+        name = ctx.triggered_id["region"] if isinstance(ctx.triggered_id, dict) else current
+        return name, [region_btn_style(n == name) for n in REGIONS]
+
     # Eye toggles: swap the icon and dim the hidden channel's thumbnail.
     eye_outputs = []
     for k in range(3):
@@ -2638,100 +2821,211 @@ def create_dash_app(store: "FrameStore") -> Dash:
             ]
         return tuple(out)
 
-    @app.callback(
-        Output("save-status", "children"),
-        Input("btn-save-full", "n_clicks"),
-        State("wb-0-h", "value"),
-        State("wb-0-c", "value"),
-        State("wb-0-l", "value"),
-        State("wb-1-h", "value"),
-        State("wb-1-c", "value"),
-        State("wb-1-l", "value"),
-        State("wb-2-h", "value"),
-        State("wb-2-c", "value"),
-        State("wb-2-l", "value"),
-        State("ch-select-0", "value"),
-        State("ch-select-1", "value"),
-        State("ch-select-2", "value"),
+    SAVE_STATES = [
+        *[State(f"wb-{k}-{p}", "value") for k in range(3) for p in "hcl"],
+        *[State(f"ch-select-{k}", "value") for k in range(3)],
         State("gamma", "value"),
         State("contrast", "value"),
-        State("ch-eye-0", "n_clicks"),
-        State("ch-eye-1", "n_clicks"),
-        State("ch-eye-2", "n_clicks"),
+        *[State(f"ch-eye-{k}", "n_clicks") for k in range(3)],
         State("source-select", "value"),
         State("frame-slider", "value"),
         *[State(sid, "value") for sid in ENHANCE_SLIDER_IDS],
-        prevent_initial_call=True,
-    )
-    def save_full_res(
-        _n_clicks,
-        w0h,
-        w0c,
-        w0l,
-        w1h,
-        w1c,
-        w1l,
-        w2h,
-        w2c,
-        w2l,
-        ch0,
-        ch1,
-        ch2,
-        gamma,
-        contrast,
-        eye0,
-        eye1,
-        eye2,
-        source_name,
-        frame,
-        structure,
-        sh_amount,
-        sh_radius,
-        sh_detail,
-        sh_masking,
-    ):
-        src = store.source(source_name)
-        frame = int(frame or 0)
-        triplet = tuple(norm_wavel(w) for w in (ch0, ch1, ch2))
-        if all(w is None for w in triplet):
-            return "Nothing to save: all R/G/B slots are empty."
-        visible = visibility_mask(eye0, eye1, eye2)
-        gamma = float(gamma) if gamma else 1.0
-        contrast = float(contrast) if contrast else 0.0
-        tp = make_tone_params(gamma, contrast, structure, sh_amount, sh_radius, sh_detail, sh_masking)
-        wb_lch = [
-            {"H": float(w0h), "C": float(w0c), "L": float(w0l)},
-            {"H": float(w1h), "C": float(w1c), "L": float(w1l)},
-            {"H": float(w2h), "C": float(w2c), "L": float(w2l)},
-        ]
-        rgbmix = lch_to_rgbmix(wb_lch) * visible  # save what the preview shows (hidden channels left out)
-        frame_cache = store.get(src.name, frame)
-        mids = frame_cache.get(triplet).contrast_mid(gamma, contrast)
+    ]
 
-        # Same pipeline as RGBMixer/process_rgb_image for jp2 (visualization.scale_rgb, then RGB -> BGR),
-        # with the fixed 0..255 input range the preview uses, and all-zero inputs for empty slots.
+    def read_save_settings(vals):
+        """SAVE_STATES values -> (source, frame, triplet, rgbmix, tone params); None triplet if all slots empty."""
+        wb, chans = vals[0:9], vals[9:12]
+        gamma, contrast = vals[12:14]
+        eyes, (source_name, frame), enhance = vals[14:17], vals[17:19], vals[19:]
+        src = store.source(source_name)
+        triplet = tuple(norm_wavel(w) for w in chans)
+        tp = make_tone_params(gamma, contrast, *enhance)
+        wb_lch = [{"H": float(wb[3 * k]), "C": float(wb[3 * k + 1]), "L": float(wb[3 * k + 2])} for k in range(3)]
+        visible = visibility_mask(*eyes)
+        rgbmix = lch_to_rgbmix(wb_lch) * visible  # save what the preview shows (hidden channels left out)
+        hidden = "".join(f"_hide{w}" for w, v in zip(triplet, visible) if w and not v)
+        return src, int(frame or 0), triplet, rgbmix, tp, hidden
+
+    def output_stem(triplet, hidden, tp) -> str:
+        """File name stem: channels, hidden channels and tone curve (sharpening goes in the sub-folder name)."""
+        return f"im_custom_lch_jp2_{'_'.join(w or 'none' for w in triplet)}{hidden}_gamma{tp.gamma:.2f}_contrast{tp.contrast:.1f}"
+
+    def output_dir_for(src, tp, view_name) -> str:
+        """<output_dir>/<sharpening sub-folder>/<region>, e.g. mgn0.050_amt1.00_rad1.0_det25_msk0/Q2, or
+        sharp_off/full-disk."""
+        parts = []
+        if tp.structure > 1e-6:
+            parts.append(f"mgn{tp.structure:.3f}")
+        if tp.amount > 1e-6:
+            parts += [f"amt{tp.amount:.2f}", f"rad{tp.radius:.1f}", f"det{tp.detail:.0f}", f"msk{tp.masking:.0f}"]
+        region = view_name if view_name in REGIONS else DEFAULT_VIEW
+        return os.path.join(src.output_dir, "_".join(parts) or "sharp_off", region)
+
+    def frame_pivots(src, frame, triplet, tp):
+        """Contrast pivots and sharpening mask thresholds the preview uses for this frame."""
+        td = store.get(src.name, frame).get(triplet)
+        mask_thr = td.mask_thresholds(tp) if tp.amount > 0 and tp.masking > 0 else None
+        return tuple(td.contrast_mid(tp.gamma, tp.contrast)), mask_thr
+
+    def write_full_res(src, frame, triplet, rgbmix, tp, mids, mask_thr, view_name, out_dir, stem) -> tuple[str, tuple]:
+        """Render the selected region of one frame at full resolution and write it as JPEG; returns
+        (path, (width, height)).
+
+        Same pipeline as RGBMixer/process_rgb_image for jp2 (visualization.scale_rgb, then RGB -> BGR),
+        with the fixed 0..255 input range the preview uses, and all-zero inputs for empty slots."""
         files = src.files_for(frame)
         raw = [visualization.load_jp2(files[w]) if w else None for w in triplet]
         shape = next(r.shape for r in raw if r is not None)
         raw = [r if r is not None else np.zeros(shape) for r in raw]
+        padded, inner = region_slices(view_name)
+        raw = [r[padded] for r in raw]
         im = visualization.scale_rgb(
-            raw, np.zeros(3), np.full(3, 255.0), gamma_rgb=(gamma, gamma, gamma), rgbmix=rgbmix,
-            contrast=contrast, contrast_mid=tuple(mids), structure=tp.structure, sharpen=tp.sharpen,
-            sharpen_mask_thr=frame_cache.get(triplet).mask_thresholds(tp) if tp.amount > 0 and tp.masking > 0 else None,
+            raw, np.zeros(3), np.full(3, 255.0), gamma_rgb=(tp.gamma,) * 3, rgbmix=rgbmix,
+            contrast=tp.contrast, contrast_mid=mids, structure=tp.structure, sharpen=tp.sharpen,
+            sharpen_mask_thr=mask_thr,
         )
-        bgr = np.clip(np.flip(im, axis=2), 0, 255).astype(np.uint8)
-
-        hidden = "".join(f"_hide{w}" for w, v in zip(triplet, visible) if w and not v)
-        stem = f"im_custom_lch_jp2_{'_'.join(w or 'none' for w in triplet)}{hidden}_gamma{gamma:.2f}_contrast{contrast:.1f}"
-        if tp.structure > 1e-6:
-            stem += f"_mgn{tp.structure:.3f}"
-        if tp.amount > 1e-6:
-            stem += f"_sharp{tp.amount:.2f}-r{tp.radius:.1f}-d{tp.detail:.0f}-m{tp.masking:.0f}"
+        bgr = np.ascontiguousarray(np.clip(np.flip(im[inner], axis=2), 0, 255).astype(np.uint8))
         suffix = src.frame_times[frame] if src.is_event else "0000"
-        os.makedirs(src.output_dir, exist_ok=True)
-        out_path = os.path.join(src.output_dir, f"{stem}_{suffix}.jpeg")
+        os.makedirs(out_dir, exist_ok=True)
+        out_path = os.path.join(out_dir, f"{stem}_{suffix}.jpeg")
         cv2.imwrite(out_path, bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
-        return f"Saved full {bgr.shape[1]}×{bgr.shape[0]} image to: {out_path}"
+        return out_path, (bgr.shape[1], bgr.shape[0])
+
+    @app.callback(
+        Output("save-status", "children"),
+        Input("btn-save-full", "n_clicks"),
+        State("view-select", "data"),
+        *SAVE_STATES,
+        prevent_initial_call=True,
+    )
+    def save_full_res(_n_clicks, view_name, *vals):
+        src, frame, triplet, rgbmix, tp, hidden = read_save_settings(vals)
+        if all(w is None for w in triplet):
+            return "Nothing to save: all R/G/B slots are empty."
+        mids, mask_thr = frame_pivots(src, frame, triplet, tp)
+        out_path, (w, h) = write_full_res(
+            src, frame, triplet, rgbmix, tp, mids, mask_thr, view_name, output_dir_for(src, tp, view_name),
+            output_stem(triplet, hidden, tp),
+        )
+        return f"Saved full-resolution {w}×{h} image to: {out_path}"
+
+    @app.callback(
+        Output("cache-load-store", "data"),
+        Output("ch-select-0", "value", allow_duplicate=True),
+        Output("ch-select-1", "value", allow_duplicate=True),
+        Output("ch-select-2", "value", allow_duplicate=True),
+        Output("ch-eye-0", "n_clicks"),
+        Output("ch-eye-1", "n_clicks"),
+        Output("ch-eye-2", "n_clicks"),
+        Output("gamma", "value"),
+        Output("contrast", "value"),
+        *[Output(sid, "value") for sid in ENHANCE_SLIDER_IDS],
+        Output("view-select", "data", allow_duplicate=True),
+        Output({"type": "region-btn", "region": ALL}, "style", allow_duplicate=True),
+        Output("preset-status", "children", allow_duplicate=True),
+        Input("btn-load-cache", "n_clicks"),
+        State("source-select", "value"),
+        prevent_initial_call=True,
+    )
+    def load_cached_settings(_n_clicks, source_name):
+        """Restore the cached settings; the color part goes through master_update (cache-load-store) in the
+        same update as the channel / tone / sharpening controls, so the mix is recomputed once."""
+        n_out = 11 + len(ENHANCE_SLIDER_IDS)
+        try:
+            with open(CACHE_FILE, encoding="utf-8") as f:
+                cached = json.load(f)
+            parse_preset(cached)  # validate the color part before touching any control
+            st = cached["settings"]
+            available = set(store.source(source_name).wavelengths)
+            chans = [w if (w in available or w == EMPTY_SLOT) else no_update for w in st["channels_rgb"]]
+            eyes = [0 if v else 1 for v in st["visible_rgb"]]
+            values = [
+                float(np.clip(st["gamma"], GAMMA_MIN, GAMMA_MAX)),
+                float(np.clip(st["contrast"], CONTRAST_MIN, CONTRAST_MAX)),
+                st["structure"], st["sharpen_amount"], st["sharpen_radius"], st["sharpen_detail"], st["sharpen_masking"],
+            ]
+            region = st.get("region") if st.get("region") in REGIONS else DEFAULT_VIEW
+        except FileNotFoundError:
+            return (no_update,) * n_out + ("No cached settings yet: they are written whenever a setting changes.",)
+        except (ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
+            return (no_update,) * n_out + (f"Could not read {os.path.relpath(CACHE_FILE, PROJECT_DIR)}: {exc}",)
+        missing = [w for w, c in zip(st["channels_rgb"], chans) if c is no_update]
+        note = f" ({', '.join(missing)} Å not in this data source: kept current channel)" if missing else ""
+        status = f"Loaded the latest settings (cached {cached.get('info', {}).get('saved_utc', '?')}){note}"
+        return (
+            {"preset": cached, "nonce": time.time()}, *chans, *eyes, *values,
+            region, [region_btn_style(n == region) for n in REGIONS], status,
+        )
+
+    # One batch job at a time, run in a background thread; the page polls its progress.
+    batch = {"thread": None, "cancel": threading.Event(), "done": 0, "total": 0, "msg": ""}
+    # Frames render in parallel threads: JP2 decoding, OpenCV and numpy release the GIL, and threads measured
+    # faster than a process pool here (no pickling or worker start-up). Each frame holds ~1 GB of float arrays.
+    BATCH_WORKERS = min(8, os.cpu_count() or 1)
+
+    def run_batch(src, triplet, rgbmix, tp, mids, mask_thr, out_dir, stem, view_name):
+        t0 = time.time()
+        lock = threading.Lock()
+        try:
+            def one(frame):
+                if not batch["cancel"].is_set():
+                    write_full_res(src, frame, triplet, rgbmix, tp, mids, mask_thr, view_name, out_dir, stem)
+                    with lock:
+                        batch["done"] += 1
+
+            with ThreadPoolExecutor(BATCH_WORKERS) as pool:
+                list(pool.map(one, range(src.n_frames)))
+            if batch["cancel"].is_set():
+                batch["msg"] = f"Batch cancelled after {batch['done']} / {src.n_frames} frames ({out_dir})."
+                return
+            msg = f"Batch done: {src.n_frames} frames in {time.time() - t0:.0f} s → {out_dir}"
+            batch["msg"] = msg + " · encoding movie…"
+            event_dir = os.path.dirname(src.output_dir)
+            settings_dir, region = os.path.split(out_dir)
+            movie_name = f"movie_{stem}_{os.path.basename(settings_dir)}_{region}"
+            # the frames are already cropped to the region: only scale them (longest side 1024 px)
+            movie = create_movie.create_movie(
+                out_dir, os.path.join(event_dir, movie_name), frame_size=region_out_size(region), pattern=f"{stem}_*.jpeg",
+            )
+            batch["msg"] = f"{msg} · movie: {movie}"
+        except Exception as exc:  # report in the UI instead of dying silently in the thread
+            batch["msg"] = f"Batch failed after {batch['done']} frames: {exc}"
+
+    @app.callback(
+        Output("batch-status", "children"),
+        Output("batch-poll", "disabled"),
+        Output("btn-save-batch", "children"),
+        Input("btn-save-batch", "n_clicks"),
+        Input("batch-poll", "n_intervals"),
+        State("view-select", "data"),
+        *SAVE_STATES,
+        prevent_initial_call=True,
+    )
+    def save_batch(_n_clicks, _n_intervals, view_name, *vals):
+        running = batch["thread"] is not None and batch["thread"].is_alive()
+        if ctx.triggered_id == "btn-save-batch":
+            if running:
+                batch["cancel"].set()
+                return "Cancelling batch…", False, "Save Batch"
+            src, frame, triplet, rgbmix, tp, hidden = read_save_settings(vals)
+            if not src.is_event:
+                return "Save Batch needs an event folder (select one under Data Source).", True, "Save Batch"
+            if all(w is None for w in triplet):
+                return "Nothing to save: all R/G/B slots are empty.", True, "Save Batch"
+            # Contrast pivots and mask thresholds of the current frame are applied to every frame, so the
+            # tone curve and sharpening mask stay fixed through the sequence (no frame-to-frame flicker).
+            mids, mask_thr = frame_pivots(src, frame, triplet, tp)
+            batch.update(cancel=threading.Event(), done=0, total=src.n_frames, msg="")
+            batch["thread"] = threading.Thread(
+                target=run_batch, daemon=True,
+                args=(src, triplet, rgbmix, tp, mids, mask_thr, output_dir_for(src, tp, view_name), output_stem(triplet, hidden, tp), view_name),
+            )
+            batch["thread"].start()
+            running = True
+        if running:
+            status = batch["msg"] or f"Batch: {batch['done']} / {batch['total']} frames…"
+            return status, False, "Cancel Batch"
+        return batch["msg"], True, "Save Batch"
 
     return app
 

@@ -5,6 +5,7 @@ dev_Lab/script_RGBMixer_parallel.py), with optional cropping, resizing, and padd
 
 import argparse
 import os
+import time
 import visualization
 
 
@@ -86,19 +87,21 @@ def parse_args():
     return parser.parse_args()
 
 
-def main():
-    args = parse_args()
+def create_movie(images_dir, output=None, crop=None, frame_size=None, padded_size=None, fps=30, pattern="*.jpeg"):
+    """Encode images_dir/<pattern> into an MP4 and return its path.
 
-    images_dir = os.path.abspath(os.path.expanduser(args.images_dir))
+    output: movie path with or without .mp4 (default: auto-named, in <data_dir> when images_dir is
+    <data_dir>/rgb_images, else in images_dir). Raises RuntimeError if ffmpeg did not write the movie."""
+    images_dir = os.path.abspath(os.path.expanduser(images_dir))
     if not os.path.isdir(images_dir):
         raise ValueError(f"Images directory does not exist: {images_dir}")
 
-    crop = list(args.crop) if args.crop is not None else None
-    frame_size = tuple(args.frame_size) if args.frame_size is not None else None
-    padded_size = tuple(args.padded_size) if args.padded_size is not None else None
+    crop = list(crop) if crop is not None else None
+    frame_size = tuple(frame_size) if frame_size is not None else None
+    padded_size = tuple(padded_size) if padded_size is not None else None
 
-    if args.output is not None:
-        movie_filename = os.path.expanduser(args.output)
+    if output is not None:
+        movie_filename = os.path.expanduser(output)
         if movie_filename.endswith(".mp4"):
             movie_filename = movie_filename[:-4]
     else:
@@ -110,6 +113,7 @@ def main():
             else images_dir
         )
         movie_filename = os.path.join(parent_dir, default_name)
+    movie_filename = os.path.abspath(movie_filename)  # encode_video runs ffmpeg with cwd=images_dir
 
     print(f"Images directory : {images_dir}")
     print(f"Crop             : {crop}")
@@ -117,15 +121,25 @@ def main():
     print(f"Padded size      : {padded_size}")
     print(f"Output movie     : {movie_filename}.mp4")
 
+    out_path = movie_filename + ".mp4"
+    start = time.time()
     visualization.encode_video(
         images_dir,
         movie_filename,
-        fps=args.fps,
+        fps=fps,
         crop=crop,
         frame_size=frame_size,
         padded_size=padded_size,
-        image_pattern_search=args.pattern,
+        image_pattern_search=pattern,
     )
+    if not os.path.isfile(out_path) or os.path.getmtime(out_path) < start:
+        raise RuntimeError(f"ffmpeg did not write {out_path}")
+    return out_path
+
+
+def main():
+    args = parse_args()
+    create_movie(args.images_dir, args.output, args.crop, args.frame_size, args.padded_size, args.fps, args.pattern)
 
 
 if __name__ == "__main__":
