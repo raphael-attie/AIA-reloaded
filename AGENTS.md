@@ -1,6 +1,7 @@
 # Agent Instructions
 
-Read the README.md file for instructions on how to use the project.
+Read readme.md at the start of every session, and go back to it when you need to be reminded 
+for instructions on how to use the project.
 
 ## Python Environment
 

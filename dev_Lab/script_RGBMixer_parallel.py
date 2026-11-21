@@ -32,7 +32,7 @@ def parse_args():
         "-o",
         "--outputdir",
         default=None,
-        help="Output directory for RGB JPEG images (default: <data_dir>/rgb_images)",
+        help="Output directory for RGB JPEG images (default: <data_dir>/rgb_batches)",
     )
     parser.add_argument(
         "-n",
@@ -54,7 +54,7 @@ def main():
     outputdir = (
         os.path.abspath(os.path.expanduser(args.outputdir))
         if args.outputdir is not None
-        else os.path.join(data_dir, "rgb_images")
+        else os.path.join(data_dir, "rgb_batches")
     )
     os.makedirs(outputdir, exist_ok=True)
 

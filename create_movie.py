@@ -28,17 +28,17 @@ def parse_args():
         description="Encode an MP4 movie from a directory of RGB JPEG images using ffmpeg.",
         epilog=(
             "Examples:\n"
-            "  python create_movie.py ~/data/AIA/event_2012-08-31_1800_2012-08-31_2200/rgb_images -s 1080 1080\n"
-            "  python create_movie.py ~/data/AIA/event_2012-08-31_1800_2012-08-31_2200/rgb_images -c 3840 2160 128 1935 -s 1920 1080\n"
-            "  python create_movie.py ~/data/AIA/event_2012-08-31_1800_2012-08-31_2200/rgb_images -s 1080 1080 -p 1920 1080"
+            "  python create_movie.py ~/data/AIA/event_2012-08-31_1800_2012-08-31_2200/rgb_batches -s 1080 1080\n"
+            "  python create_movie.py ~/data/AIA/event_2012-08-31_1800_2012-08-31_2200/rgb_batches -c 3840 2160 128 1935 -s 1920 1080\n"
+            "  python create_movie.py ~/data/AIA/event_2012-08-31_1800_2012-08-31_2200/rgb_batches -s 1080 1080 -p 1920 1080"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
         "images_dir",
         nargs="?",
-        default="~/data/AIA/event_2012-08-31_1800_2012-08-31_2200/rgb_images",
-        help="Directory containing the RGB JPEG images (default: ~/data/AIA/event_2012-08-31_1800_2012-08-31_2200/rgb_images)",
+        default="~/data/AIA/event_2012-08-31_1800_2012-08-31_2200/rgb_batches",
+        help="Directory containing the RGB JPEG images (default: ~/data/AIA/event_2012-08-31_1800_2012-08-31_2200/rgb_batches)",
     )
     parser.add_argument(
         "-c",
@@ -91,7 +91,7 @@ def create_movie(images_dir, output=None, crop=None, frame_size=None, padded_siz
     """Encode images_dir/<pattern> into an MP4 and return its path.
 
     output: movie path with or without .mp4 (default: auto-named, in <data_dir> when images_dir is
-    <data_dir>/rgb_images, else in images_dir). Raises RuntimeError if ffmpeg did not write the movie."""
+    <data_dir>/rgb_batches, else in images_dir). Raises RuntimeError if ffmpeg did not write the movie."""
     images_dir = os.path.abspath(os.path.expanduser(images_dir))
     if not os.path.isdir(images_dir):
         raise ValueError(f"Images directory does not exist: {images_dir}")
@@ -106,10 +106,11 @@ def create_movie(images_dir, output=None, crop=None, frame_size=None, padded_siz
             movie_filename = movie_filename[:-4]
     else:
         default_name = build_default_movie_name(crop, frame_size, padded_size)
-        # If images_dir is a subdirectory like <data_dir>/rgb_images, save the movie right under <data_dir>
+        # If images_dir is a subdirectory like <data_dir>/rgb_batches (rgb_images in older event folders),
+        # save the movie right under <data_dir>
         parent_dir = (
             os.path.dirname(images_dir)
-            if os.path.basename(images_dir) == "rgb_images"
+            if os.path.basename(images_dir) in ("rgb_batches", "rgb_images")
             else images_dir
         )
         movie_filename = os.path.join(parent_dir, default_name)

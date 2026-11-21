@@ -3,7 +3,7 @@ Script automating the creation of AIA RGB images and movies from JPEG2000 (.jp2)
 This script assumes that AIA .jp2 files from the 3 different wavelengths are in three subdirectories
 under the same parent directory `data_dir` (e.g. created by get_data.py).
 
-The script first creates RGB/CIELab JPEG images written to `<data_dir>/rgb_images` (by default),
+The script first creates RGB/CIELab JPEG images written to `<data_dir>/rgb_batches` (by default),
 then calls ffmpeg to encode the movie directly under `data_dir`.
 """
 
@@ -34,7 +34,7 @@ def parse_args():
         "-o",
         "--outputdir",
         default=None,
-        help="Output directory for RGB JPEG images (default: <data_dir>/rgb_images)",
+        help="Output directory for RGB JPEG images (default: <data_dir>/rgb_batches)",
     )
     parser.add_argument(
         "-n",
@@ -56,7 +56,7 @@ def main():
     outputdir = (
         os.path.abspath(os.path.expanduser(args.outputdir))
         if args.outputdir is not None
-        else os.path.join(data_dir, "rgb_images")
+        else os.path.join(data_dir, "rgb_batches")
     )
     os.makedirs(outputdir, exist_ok=True)
 

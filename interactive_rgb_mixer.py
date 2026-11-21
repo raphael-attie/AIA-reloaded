@@ -27,6 +27,7 @@ import re
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from collections import OrderedDict
+from datetime import datetime, timedelta, timezone
 from typing import NamedTuple
 import os
 import time
@@ -36,6 +37,7 @@ from dash import ALL, Dash, Input, Output, State, ctx, dcc, html, no_update
 
 import visualization
 import create_movie
+import get_data
 
 # sunpy's standard SDO/AIA colormaps (sunpy.visualization.colormaps; needs `sunpy[visualization]`).
 from sunpy.visualization import colormaps as sunpy_cm
@@ -58,6 +60,9 @@ DEFAULT_JP2_RGBMIX = np.array(
 GLOBAL_H_MIN, GLOBAL_H_MAX = -180.0, 180.0
 GLOBAL_C_MIN, GLOBAL_C_MAX = 0.0, 2.2
 GLOBAL_L_MIN, GLOBAL_L_MAX = 0.2, 2.2
+COLORMAP_L_MAX = 5.0  # Global Luminance range in colormap mode or with one channel shown: a linear stretch
+GLOBAL_L_MARKS = {0.5: "0.5×", 1.0: "1.0×", 1.5: "1.5×", 2.0: "2.0×"}
+COLORMAP_L_MARKS = {0.5: "0.5×", 1.0: "1.0×", 2.0: "2.0×", 3.0: "3.0×", 4.0: "4.0×", 5.0: "5.0×"}
 
 # Input gamma slider bounds: each input channel x in [0, 1] is mapped to x**(1/gamma) before
 # mixing, as visualization.scale_rgb does with RGBMixer.gamma_rgb. gamma > 1 lifts faint loops a
@@ -70,6 +75,16 @@ CONTRAST_MIN, CONTRAST_MAX = 0.0, 12.0
 WB_H_MIN, WB_H_MAX = 0.0, 360.0
 WB_C_MIN, WB_C_MAX = 0.0, 0.9
 WB_L_MIN, WB_L_MAX = -0.3, 1.4
+WB_CL_STEP = 0.01  # Option 2 Chroma / Luminance slider step: values are kept at 2 decimals
+
+
+def round_wb(H: float, C: float, L: float) -> dict[str, float]:
+    """Option 2 slider position of one waveband: H to 0.1°, C and L clipped to range and rounded to 2 decimals."""
+    return {
+        "H": round(float(H) % 360.0, 1),
+        "C": round(float(np.clip(C, WB_C_MIN, WB_C_MAX)), 2),
+        "L": round(float(np.clip(L, WB_L_MIN, WB_L_MAX)), 2),
+    }
 
 # -----------------------------------------------------------------------------
 # Linear Perceptual Oklab / Oklch Opponent Transform
@@ -142,13 +157,7 @@ def apply_global_to_anchor(
     gl: float,
 ) -> list[dict[str, float]]:
     """Compute effective per-waveband (H, C, L) slider positions from anchor + global settings."""
-    out = []
-    for i in range(3):
-        h_eff = round(float((anchor_wb[i]["H"] + gh) % 360.0), 1)
-        c_eff = round(float(np.clip(anchor_wb[i]["C"] * gc, WB_C_MIN, WB_C_MAX)), 3)
-        l_eff = round(float(np.clip(anchor_wb[i]["L"] * gl, WB_L_MIN, WB_L_MAX)), 3)
-        out.append({"H": h_eff, "C": c_eff, "L": l_eff})
-    return out
+    return [round_wb(anchor_wb[i]["H"] + gh, anchor_wb[i]["C"] * gc, anchor_wb[i]["L"] * gl) for i in range(3)]
 
 
 # -----------------------------------------------------------------------------
@@ -392,14 +401,7 @@ def compute_auto_balance_presets(pixels: np.ndarray) -> dict[str, dict]:
         rgbmix = lch_to_rgbmix(wb_lch)
         peak = float(np.percentile(np.max(pixels @ rgbmix.T, axis=1), pct))
         scale = target_max / peak if peak > 1e-6 else 1.0
-        return [
-            {
-                "H": round(float(w["H"]) % 360.0, 1),
-                "C": round(float(np.clip(w["C"] * scale, WB_C_MIN, WB_C_MAX)), 3),
-                "L": round(float(np.clip(w["L"] * scale, WB_L_MIN, WB_L_MAX)), 3),
-            }
-            for w in wb_lch
-        ]
+        return [round_wb(w["H"], w["C"] * scale, w["L"] * scale) for w in wb_lch]
 
     # Split-Complementary Warm-Cool Harmony
     h_wc = [24.0, 106.0, 245.0]
@@ -455,6 +457,15 @@ def preset_path(name: str) -> str:
     if not stem or not re.fullmatch(r"[A-Za-z0-9._ -]+", stem) or stem.startswith("."):
         raise ValueError("use letters, digits, spaces, '.', '_' or '-' only (no folders)")
     return os.path.join(PRESETS_DIR, name)
+
+
+def preset_tag(filename: str | None) -> str | None:
+    """File name tag of a loaded preset: its stem without the leading "preset", e.g.
+    preset_304_171_211_burning_ice.json -> 304_171_211_burning_ice; None if nothing is left."""
+    stem = os.path.splitext(os.path.basename(filename or ""))[0]
+    stem = re.sub(r"^preset[_\- .]*", "", stem, flags=re.IGNORECASE)
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "_", stem).strip("._-")
+    return stem or None
 
 
 def build_preset(anchor_wb, wb_lch, gh, gc, gl, triplet, rgbmix) -> dict:
@@ -516,7 +527,7 @@ CACHE_FILE = os.path.join(CACHE_DIR, "last_settings.json")
 _CACHE_LOCK = threading.Lock()  # callbacks run concurrently; one writer at a time
 
 
-def write_settings_cache(anchor_wb, wb_lch, gh, gc, gl, triplet, tp, visible, region: str) -> None:
+def write_settings_cache(anchor_wb, wb_lch, gh, gc, gl, triplet, tp, visible, region: str, tag: str | None) -> None:
     rgbmix = lch_to_rgbmix(wb_lch)
     data = build_preset(anchor_wb, wb_lch, gh, gc, gl, triplet, rgbmix)
     data["settings"] = {
@@ -530,6 +541,7 @@ def write_settings_cache(anchor_wb, wb_lch, gh, gc, gl, triplet, tp, visible, re
         "sharpen_detail": tp.detail,
         "sharpen_masking": tp.masking,
         "region": region,
+        "preset_tag": tag,  # loaded preset the colors still match (output file names), None after any color edit
     }
     with _CACHE_LOCK:
         os.makedirs(CACHE_DIR, exist_ok=True)
@@ -588,6 +600,20 @@ AIA_ROLES = {
     "1700": "Temperature Minimum & Photosphere (UV continuum)",
     "4500": "Photosphere (white light)",
 }
+# SDO/HMI products from get_data.py, selectable like AIA wavelengths (same 4096x4096 Helioviewer grid).
+HMI_CHANNELS = list(get_data.HMI_SOURCES)
+HMI_LABELS = {"continuum": "HMI continuum", "magnetogram": "HMI magnetogram"}
+CHANNEL_ROLES = {
+    **AIA_ROLES,
+    "continuum": "Photosphere (HMI intensity continuum, 6173 Å)",
+    "magnetogram": "Photospheric Magnetic Field (HMI line-of-sight magnetogram)",
+}
+CHANNELS = AIA_WAVELENGTHS + HMI_CHANNELS  # display / discovery order
+
+
+def channel_label(channel: str) -> str:
+    """Display name of a channel: '171 Å' for AIA, 'HMI magnetogram' for HMI."""
+    return HMI_LABELS.get(channel, f"{channel} Å")
 
 
 def _svg_uri(svg: str) -> str:
@@ -624,8 +650,9 @@ def visibility_mask(n0, n1, n2) -> np.ndarray:
     return np.array([1.0 if channel_visible(n) else 0.0 for n in (n0, n1, n2)])
 
 
-def aia_cmap_name(wavel: str) -> str:
-    return f"sdoaia{wavel}"
+def channel_cmap_name(channel: str) -> str:
+    """sunpy colormap of a channel; the HMI continuum has none and is shown in grayscale."""
+    return {"magnetogram": "hmimag", "continuum": "gray"}.get(channel, f"sdoaia{channel}")
 
 
 def sunpy_lut_bgr_u8(cmap_name: str) -> np.ndarray:
@@ -635,6 +662,44 @@ def sunpy_lut_bgr_u8(cmap_name: str) -> np.ndarray:
         return np.repeat(np.arange(256, dtype=np.uint8)[:, None], 3, axis=1)
     rgba = cmap(np.linspace(0.0, 1.0, 256))
     return np.round(rgba[:, 2::-1] * 255.0).astype(np.uint8)
+
+
+# Option 1 colorization: the LCh color mix (default), or one of the channel preview colormaps.
+LCH_MIX = "lch"
+COLORMAP_CHOICES = list(dict.fromkeys(channel_cmap_name(w) for w in CHANNELS))
+
+
+def colormap_bgr_u8(x: np.ndarray, cmap_name: str) -> np.ndarray:
+    """[0, 1] image -> BGR uint8 through a sunpy colormap. The one mapping used by the channel previews and by
+    the main image in colormap mode, so a channel shown alone looks identical in both."""
+    return sunpy_lut_bgr_u8(cmap_name)[np.round(np.clip(x, 0.0, 1.0) * 255.0).astype(np.uint8)]
+
+
+def colormap_input(stack: np.ndarray, weights, gain: float = 1.0) -> np.ndarray:
+    """Image colorized in colormap mode: mean of the processed (R, G, B) inputs with a nonzero weight
+    (assigned and visible slots), linearly stretched by `gain` (the Global Luminance multiplier; values
+    above 1 saturate at the top of the colormap). With gain 1, a single such channel passes through unchanged."""
+    w = np.asarray(weights, dtype=stack.dtype)
+    if w.sum() <= 0:
+        return np.zeros(stack.shape[:-1], stack.dtype)
+    return stack @ (w / w.sum() * stack.dtype.type(gain))
+
+
+def colormap_weights(triplet, visible) -> np.ndarray:
+    """1 for each R/G/B slot with a channel assigned and shown, else 0."""
+    return np.array([1.0 if w is not None else 0.0 for w in triplet]) * visible
+
+
+def single_channel_gain(anchor_wb, wb_lch, gl: float, weights) -> float:
+    """Linear gain completing Global ×L in the LCh mix when one channel is shown. Its per-waveband L
+    (anchor L × gl) is capped at the Option 2 maximum WB_L_MAX; the part above the cap is applied to the
+    image instead, so the brightness keeps growing in proportion to ×L (up to COLORMAP_L_MAX). 1 otherwise."""
+    shown = np.flatnonzero(weights)
+    if len(shown) != 1:
+        return 1.0
+    k = int(shown[0])
+    want, have = float(anchor_wb[k]["L"]) * float(gl), float(wb_lch[k]["L"])
+    return want / have if have >= WB_L_MAX - 1e-9 and want > have * (1 + 1e-6) else 1.0
 COLOR_WHEEL_URI = generate_color_wheel_uri(148)
 
 
@@ -920,8 +985,16 @@ class TripletData:
         tp: ToneParams = ToneParams(),
         scalemin: float = 0.0,
         jpeg_quality: int = 92,
+        cmap: str | None = None,
+        weights=None,
+        gain: float = 1.0,
     ) -> str:
-        """Apply the per-channel processing and the 3x3 rgbmix to the cached float32 stack; return a JPEG data URI."""
+        """Apply the per-channel processing and the 3x3 rgbmix to the cached float32 stack; return a JPEG data URI.
+        With `cmap`, the processed inputs with nonzero `weights` are averaged, stretched by `gain` and colorized
+        with that sunpy colormap instead (colormap_input / colormap_bgr_u8, as the channel previews)."""
+        if cmap is not None:
+            x = colormap_input(self.tone_view(view_name, tp), weights, gain)
+            return _encode_uri(colormap_bgr_u8(x, cmap), jpeg_quality)
         mixed = self.tone_view(view_name, tp) @ rgbmix.astype(np.float32).T
         np.clip(mixed, 0.0, 1.0, out=mixed)
         mixed *= 255.0
@@ -934,7 +1007,7 @@ class TripletData:
 class JP2ImageCache:
     """
     Pre-loads every available 4096x4096 JP2 wavelength once as small preview views, plus each
-    wavelength rendered alone in its sunpy SDO/AIA colormap. Mixing stacks, statistics and presets
+    wavelength rendered alone in its sunpy SDO/AIA (or HMI) colormap. Mixing stacks, statistics and presets
     for a selected (R, G, B) triplet are built on demand and kept for the most recent triplets.
     """
 
@@ -951,12 +1024,10 @@ class JP2ImageCache:
         self._triplets: dict[tuple, TripletData] = {}
 
     def channel_uri(self, wavel: str, view_name: str) -> str:
-        """The wavelength alone in its sunpy SDO/AIA colormap (encoded on first request)."""
+        """The wavelength alone in its sunpy SDO/AIA (or HMI) colormap (encoded on first request)."""
         key = (wavel, view_name)
         if key not in self._channel_uris:
-            lut = sunpy_lut_bgr_u8(aia_cmap_name(wavel))
-            v = self.channel_views[wavel][view_name]
-            self._channel_uris[key] = _encode_uri(lut[np.round(np.clip(v, 0.0, 1.0) * 255.0).astype(np.uint8)])
+            self._channel_uris[key] = _encode_uri(colormap_bgr_u8(self.channel_views[wavel][view_name], channel_cmap_name(wavel)))
         return self._channel_uris[key]
 
     def get(self, triplet) -> TripletData:
@@ -984,17 +1055,22 @@ def norm_wavel(w):
     return None if w in (None, "", EMPTY_SLOT) else str(w)
 
 
-class DataSource:
-    """A set of time-aligned JP2 frames per AIA wavelength."""
+# Output sub-folders of a data source folder (the event folder, or samples/): one per save button.
+SNAPSHOTS_DIR = "rgb_snapshots"  # Save Full-Res JPEG: the current frame
+BATCHES_DIR = "rgb_batches"  # Save Batch: every frame of the event, plus the movie in the event folder
 
-    def __init__(self, name: str, label: str, files_by_wavel: dict[str, list[str]], frame_times: list[str], output_dir: str, is_event: bool):
+
+class DataSource:
+    """A set of time-aligned JP2 frames per AIA wavelength or HMI channel."""
+
+    def __init__(self, name: str, label: str, files_by_wavel: dict[str, list[str]], frame_times: list[str], root_dir: str, is_event: bool):
         self.name = name
         self.label = label
         self.files_by_wavel = files_by_wavel
-        self.wavelengths = [w for w in AIA_WAVELENGTHS if w in files_by_wavel]
+        self.wavelengths = [w for w in CHANNELS if w in files_by_wavel]
         self.frame_times = frame_times
         self.n_frames = len(frame_times)
-        self.output_dir = output_dir
+        self.root_dir = root_dir  # event folder or samples folder; outputs go to its SNAPSHOTS_DIR / BATCHES_DIR
         self.is_event = is_event
 
     def files_for(self, frame: int) -> dict[str, str]:
@@ -1017,10 +1093,12 @@ def samples_source(samples_dir: str) -> DataSource:
 
 def event_source(event_dir: str) -> DataSource | None:
     """Event folder from get_data.py: one sub-folder per wavelength. Frames are the timestamps
-    (parsed from the file names) present in every channel; if file names carry no timestamp,
-    frames are aligned by sorted order."""
+    (parsed from the file names) of the channel with the most files, i.e. the finest cadence (AIA at
+    36 s next to HMI at 45 s); every other channel contributes its nearest file within half its own
+    cadence, and frames lacking a channel are dropped. If file names carry no timestamp, frames are
+    aligned by sorted order."""
     per_wavel = {}
-    for w in AIA_WAVELENGTHS:
+    for w in CHANNELS:
         files = sorted(glob.glob(os.path.join(event_dir, w, "*.jp2")))
         if files:
             per_wavel[w] = files
@@ -1028,17 +1106,29 @@ def event_source(event_dir: str) -> DataSource | None:
         return None
     stamped = {w: {m.group(1): f for f in fs if (m := _TIMESTAMP_RE.search(os.path.basename(f)))} for w, fs in per_wavel.items()}
     if all(len(stamped[w]) == len(per_wavel[w]) for w in per_wavel):
-        times = sorted(set.intersection(*(set(d) for d in stamped.values())))
-        files_by_wavel = {w: [stamped[w][t] for t in times] for w in per_wavel}
+        timed = {w: sorted((datetime.strptime(t, "%Y-%m-%dT%H%M%S"), f) for t, f in d.items()) for w, d in stamped.items()}
+        tolerance = {  # half the channel's cadence (median step between its files); exact match only for one file
+            w: timedelta(seconds=float(np.median(np.diff([t.timestamp() for t, _ in tf]))) / 2 if len(tf) > 1 else 0)
+            for w, tf in timed.items()
+        }
+        ref = max(per_wavel, key=lambda w: len(per_wavel[w]))  # first in CHANNELS order on ties
+        times, files_by_wavel = [], {w: [] for w in per_wavel}
+        for t in sorted(stamped[ref]):
+            dt = datetime.strptime(t, "%Y-%m-%dT%H%M%S")
+            files = {w: get_data.nearest_local(timed[w], dt, tolerance[w]) for w in per_wavel}
+            if all(f is not None for f in files.values()):
+                times.append(t)
+                for w, f in files.items():
+                    files_by_wavel[w].append(str(f))
     else:
         n = min(len(fs) for fs in per_wavel.values())
-        times = [f"frame {i + 1}" for i in range(n)]
+        times = [f"frame {i}" for i in range(n)]
         files_by_wavel = {w: fs[:n] for w, fs in per_wavel.items()}
     if not times:
         return None
     name = os.path.basename(os.path.normpath(event_dir))
-    label = f"{name}  ({', '.join(files_by_wavel)} Å · {len(times)} frames)"
-    return DataSource(name, label, files_by_wavel, times, os.path.join(event_dir, "rgb_images"), is_event=True)
+    label = f"{name}  ({', '.join(channel_label(w) for w in files_by_wavel)} · {len(times)} frames)"
+    return DataSource(name, label, files_by_wavel, times, event_dir, is_event=True)
 
 
 def discover_sources(samples_dir: str, data_dir: str | None) -> "OrderedDict[str, DataSource]":
@@ -1064,6 +1154,16 @@ class FrameStore:
 
     def source(self, name: str) -> DataSource:
         return self.sources.get(name) or next(iter(self.sources.values()))
+
+    def add_source(self, src: DataSource) -> None:
+        """Add or replace (after new frames were downloaded) an event; event folders stay sorted by name."""
+        with self._lock:
+            for key in [k for k in self._frames if k[0] == src.name]:
+                del self._frames[key]  # the frame list may have changed
+            events = {n: s for n, s in self.sources.items() if s.is_event}
+            events[src.name] = src
+            others = [(n, s) for n, s in self.sources.items() if not s.is_event]
+            self.sources = OrderedDict(others + sorted(events.items()))
 
     def get(self, name: str, frame) -> JP2ImageCache:
         src = self.source(name)
@@ -1314,6 +1414,20 @@ DARK_THEME_INDEX_STRING = """<!DOCTYPE html>
                 background-color: #2a2a2a !important;
                 border-color: #38bdf8 !important;
             }
+            /* Get Data date picker: compact dropdowns so five fit on one row */
+            .date-row .dash-dropdown {
+                padding: 0 !important;
+            }
+            .date-row .dash-dropdown-trigger {
+                padding: 0 4px 0 8px !important;
+                gap: 2px !important;
+            }
+            /* Get Data date picker: a requested date with no image within 2 min turns red */
+            .date-warn .dash-dropdown-value,
+            .date-warn .dash-dropdown-trigger,
+            .date-warn .date-row-label {
+                color: #ef4444 !important;
+            }
         </style>
     </head>
     <body>
@@ -1328,7 +1442,7 @@ DARK_THEME_INDEX_STRING = """<!DOCTYPE html>
 """
 
 
-def create_dash_app(store: "FrameStore") -> Dash:
+def create_dash_app(store: "FrameStore", data_dir: str) -> Dash:
     app = Dash(__name__, title="AIA-Reloaded Interactive RGB / LCh Mixer")
     app.index_string = DARK_THEME_INDEX_STRING
 
@@ -1346,7 +1460,7 @@ def create_dash_app(store: "FrameStore") -> Dash:
     init_gh_hue_color = _rgb_vec_to_css(vivid_rgb_at_hue(base_dom_h))
 
     waveband_meta = [
-        {"idx": k, "wavel": f"{w} Å", "short": w, "role": waveband_role(k, w)}
+        {"idx": k, "wavel": channel_label(w), "short": w, "role": waveband_role(k, w)}
         for k, w in enumerate(init_triplet)
     ]
 
@@ -1409,8 +1523,8 @@ def create_dash_app(store: "FrameStore") -> Dash:
                         f"wb-{i}-c",
                         WB_C_MIN,
                         WB_C_MAX,
-                        0.001,
-                        round(init["C"], 3),
+                        WB_CL_STEP,
+                        round(init["C"], 2),
                         {0.0: "0 (Gray)", 0.35: "0.35", 0.7: "0.70"},
                         wc_grad,
                         w_swatch,
@@ -1420,8 +1534,8 @@ def create_dash_app(store: "FrameStore") -> Dash:
                         f"wb-{i}-l",
                         WB_L_MIN,
                         WB_L_MAX,
-                        0.001,
-                        round(init["L"], 3),
+                        WB_CL_STEP,
+                        round(init["L"], 2),
                         {-0.2: "-0.2", 0.0: "0", 0.5: "0.5", 1.0: "1.0"},
                         wl_grad,
                         w_swatch,
@@ -1460,6 +1574,7 @@ def create_dash_app(store: "FrameStore") -> Dash:
                 data={
                     "anchor_wb": copy.deepcopy(init_anchor),
                     "last_synced_wb": copy.deepcopy(init_anchor),
+                    "preset_tag": None,  # loaded preset's name while its colors are unchanged (output file names)
                 },
             ),
             # Top Header Bar
@@ -1523,7 +1638,7 @@ def create_dash_app(store: "FrameStore") -> Dash:
                             html.Button(
                                 "Save Full-Res JPEG",
                                 id="btn-save-full",
-                                title="Save the current frame at full resolution: samples/ for the samples, <event>/rgb_images/ for an event",
+                                title="Save the current frame at full resolution into <event or samples>/rgb_snapshots/<sharpening>/<region>/",
                                 n_clicks=0,
                                 style={
                                     "backgroundColor": "#0284c7",
@@ -1539,7 +1654,7 @@ def create_dash_app(store: "FrameStore") -> Dash:
                             html.Button(
                                 "Save Batch",
                                 id="btn-save-batch",
-                                title="Render every frame of the event with the current settings into <event>/rgb_images/<sharpening>/, then encode an MP4 (create_movie.py) in the event folder",
+                                title="Render every frame of the event with the current settings into <event>/rgb_batches/<sharpening>/<region>/, then encode an MP4 (create_movie.py) in the event folder",
                                 n_clicks=0,
                                 style={
                                     "backgroundColor": "#0284c7",
@@ -1625,6 +1740,72 @@ def create_dash_app(store: "FrameStore") -> Dash:
                                         children=frame_label_text(init_src, 0),
                                         style={"fontSize": "12px", "fontFamily": "monospace", "color": "#38bdf8", "marginBottom": "10px"},
                                     ),
+                                    # Get Data: a single date/time or a date range, downloaded from Helioviewer into a new event folder
+                                    html.Div(
+                                        style={"borderTop": "1px solid #2a2a2a", "paddingTop": "8px", "marginBottom": "10px"},
+                                        children=[
+                                            html.Div(
+                                                style={"display": "flex", "alignItems": "center", "justifyContent": "space-between", "marginBottom": "6px"},
+                                                children=[
+                                                    html.Span("Get Data (UTC)", style={"fontWeight": "700", "fontSize": "12px", "color": "#f5f5f5"}),
+                                                    dcc.Checklist(
+                                                        id="dl-range",
+                                                        options=[{"label": " Date range", "value": "range"}],
+                                                        value=[],
+                                                        style={"fontSize": "12px"},
+                                                    ),
+                                                ],
+                                            ),
+                                            date_picker_row("dl-start", "Start", DEFAULT_DL_START),
+                                            date_picker_row("dl-end", "End", DEFAULT_DL_START + timedelta(hours=1), visible=False),
+                                            html.Div(
+                                                style={"display": "flex", "alignItems": "center", "gap": "4px", "marginBottom": "4px"},
+                                                children=[
+                                                    html.Span("Å", style={"width": "36px", "fontSize": "12px", "color": "#d4d4d4"}),
+                                                    dcc.Checklist(
+                                                        id="dl-channels",
+                                                        options=[{"label": f" {w}", "value": w} for w in DOWNLOAD_CHANNEL_CHOICES],
+                                                        value=list(DEFAULT_DOWNLOAD_CHANNELS),
+                                                        inline=True,
+                                                        style={"fontSize": "12px", "whiteSpace": "nowrap"},
+                                                        labelStyle={"marginRight": "6px"},
+                                                    ),
+                                                ],
+                                            ),
+                                            html.Div(
+                                                style={"display": "flex", "alignItems": "center", "gap": "4px", "marginBottom": "4px"},
+                                                children=[
+                                                    html.Span("HMI", style={"width": "36px", "fontSize": "12px", "color": "#d4d4d4"}),
+                                                    dcc.Checklist(
+                                                        id="dl-hmi-channels",
+                                                        options=[{"label": f" {w}", "value": w} for w in HMI_CHANNELS],
+                                                        value=[],
+                                                        inline=True,
+                                                        style={"fontSize": "12px", "whiteSpace": "nowrap"},
+                                                        labelStyle={"marginRight": "6px"},
+                                                    ),
+                                                ],
+                                            ),
+                                            html.Div(
+                                                style={"display": "flex", "alignItems": "flex-start", "gap": "8px", "marginTop": "6px"},
+                                                children=[
+                                                    html.Button(
+                                                        "Get Data",
+                                                        id="btn-get-data",
+                                                        n_clicks=0,
+                                                        title=f"Single date: select the frame if already downloaded, else download the closest images. "
+                                                        f"Range: download the ticked channels at {DOWNLOAD_CADENCE} s cadence (HMI: {get_data.HMI_CADENCE} s) into "
+                                                        f"<data-dir>/event_<start>_<end>/, copying frames already in other event folders",
+                                                        className="preset-btn",
+                                                        style={**frame_step_btn_style(), "padding": "4px 12px", "fontWeight": "600", "flexShrink": "0"},
+                                                    ),
+                                                    html.Div(id="dl-status", style=dl_status_style(False)),
+                                                ],
+                                            ),
+                                            dcc.Store(id="frame-request"),  # {"source", "frame"}: frame to show once on_source_change has run
+                                            dcc.Interval(id="dl-poll", interval=1000, disabled=True),
+                                        ],
+                                    ),
                                 ],
                             ),
                             # Auto-Balancing Rules Card
@@ -1703,249 +1884,216 @@ def create_dash_app(store: "FrameStore") -> Dash:
                                     ),
                                 ],
                             ),
-                            # Option 1: Global LCh Controls + Color Wheel
+                            # Color controls, one at a time in tabs: Option 1 (Global LCh + color wheel) and
+                            # Option 2 (Per-Waveband LCh). Both stay in sync whichever tab is shown.
                             html.Div(
                                 style={
                                     "backgroundColor": "#111111",
                                     "border": "1px solid #2a2a2a",
                                     "borderRadius": "8px",
-                                    "padding": "14px",
+                                    "padding": "0 14px 6px 14px",
                                     "marginBottom": "14px",
                                 },
-                                children=[
-                                    html.Div(
-                                        style={"display": "flex", "justifyContent": "space-between", "alignItems": "center", "marginBottom": "8px"},
-                                        children=[
-                                            html.Span(
-                                                "Option 1 — Global Perceptual LCh (3 Sliders)",
-                                                style={"fontWeight": "700", "fontSize": "14px", "color": "#f5f5f5"},
-                                            ),
-                                            html.Div(
-                                                style={"display": "flex", "alignItems": "center", "gap": "8px"},
-                                                children=[
-                                                    html.Div(
-                                                        id="global-swatch",
-                                                        title="Current Global Solar Tone (matches Chroma & Luminance slider thumbs)",
-                                                        style={
-                                                            "width": "22px",
-                                                            "height": "22px",
-                                                            "borderRadius": "50%",
-                                                            "border": "2px solid #fafafa",
-                                                            "backgroundColor": init_g_swatch,
-                                                        },
-                                                    ),
-                                                    html.Button(
-                                                        "Reset Global",
-                                                        id="btn-reset-global",
-                                                        n_clicks=0,
-                                                        style={
-                                                            "backgroundColor": "#2a2a2a",
-                                                            "color": "#e5e5e5",
-                                                            "border": "1px solid #525252",
-                                                            "borderRadius": "4px",
-                                                            "padding": "3px 8px",
-                                                            "cursor": "pointer",
-                                                            "fontSize": "11px",
-                                                        },
-                                                    ),
-                                                ],
-                                            ),
-                                        ],
-                                    ),
-                                    # Interactive Perceptual Color Wheel showing 304, 171, 193 positions
-                                    html.Div(
-                                        style={
-                                            "display": "flex",
-                                            "alignItems": "center",
-                                            "gap": "14px",
-                                            "backgroundColor": "#000000",
-                                            "border": "1px solid #2a2a2a",
-                                            "borderRadius": "8px",
-                                            "padding": "10px 12px",
-                                            "marginBottom": "12px",
-                                        },
-                                        children=[
-                                            html.Div(
-                                                style={
-                                                    "position": "relative",
-                                                    "width": "136px",
-                                                    "height": "136px",
-                                                    "flexShrink": "0",
-                                                    "backgroundImage": f"url('{COLOR_WHEEL_URI}')",
-                                                    "backgroundSize": "cover",
-                                                    "borderRadius": "50%",
-                                                    "border": "1px solid #3a3a3a",
-                                                },
-                                                children=[
-                                                    html.Div(
-                                                        style={
-                                                            "position": "absolute",
-                                                            "left": "50%",
-                                                            "top": "50%",
-                                                            "width": "6px",
-                                                            "height": "6px",
-                                                            "transform": "translate(-50%, -50%)",
-                                                            "borderRadius": "50%",
-                                                            "backgroundColor": "#fafafa",
-                                                            "opacity": "0.6",
-                                                        }
-                                                    ),
-                                                    html.Div(
-                                                        init_triplet[0],
-                                                        id="wheel-pin-0",
-                                                        style=_wheel_pin_style(
-                                                            init_anchor[0]["H"],
-                                                            init_anchor[0]["C"],
-                                                            lch_to_css_swatch(init_anchor[0]["L"], init_anchor[0]["C"], init_anchor[0]["H"]),
+                                children=dcc.Tabs(
+                                    id="lch-tabs",
+                                    value="global",
+                                    style={"height": "38px", "marginBottom": "12px"},
+                                    children=[
+                                        dcc.Tab(
+                                            label="Option 1 · Global",
+                                            value="global",
+                                            style=ADJUST_TAB_STYLE,
+                                            selected_style=ADJUST_TAB_SELECTED_STYLE,
+                                            children=[
+                                                html.Div(
+                                                    style={"display": "flex", "justifyContent": "space-between", "alignItems": "center", "marginBottom": "8px"},
+                                                    children=[
+                                                        html.Span(
+                                                            "Hue shift, chroma and luminance applied to all wavebands at once.",
+                                                            style={"fontSize": "11px", "color": "#d4d4d4"},
                                                         ),
-                                                    ),
-                                                    html.Div(
-                                                        init_triplet[1],
-                                                        id="wheel-pin-1",
-                                                        style=_wheel_pin_style(
-                                                            init_anchor[1]["H"],
-                                                            init_anchor[1]["C"],
-                                                            lch_to_css_swatch(init_anchor[1]["L"], init_anchor[1]["C"], init_anchor[1]["H"]),
+                                                        html.Div(
+                                                            style={"display": "flex", "alignItems": "center", "gap": "8px"},
+                                                            children=[
+                                                                html.Div(
+                                                                    id="global-swatch",
+                                                                    title="Current Global Solar Tone (matches Chroma & Luminance slider thumbs)",
+                                                                    style={
+                                                                        "width": "22px",
+                                                                        "height": "22px",
+                                                                        "borderRadius": "50%",
+                                                                        "border": "2px solid #fafafa",
+                                                                        "backgroundColor": init_g_swatch,
+                                                                    },
+                                                                ),
+                                                                html.Button(
+                                                                    "Reset Global",
+                                                                    id="btn-reset-global",
+                                                                    n_clicks=0,
+                                                                    style={
+                                                                        "backgroundColor": "#2a2a2a",
+                                                                        "color": "#e5e5e5",
+                                                                        "border": "1px solid #525252",
+                                                                        "borderRadius": "4px",
+                                                                        "padding": "3px 8px",
+                                                                        "cursor": "pointer",
+                                                                        "fontSize": "11px",
+                                                                    },
+                                                                ),
+                                                            ],
                                                         ),
-                                                    ),
-                                                    html.Div(
-                                                        init_triplet[2],
-                                                        id="wheel-pin-2",
-                                                        style=_wheel_pin_style(
-                                                            init_anchor[2]["H"],
-                                                            init_anchor[2]["C"],
-                                                            lch_to_css_swatch(init_anchor[2]["L"], init_anchor[2]["C"], init_anchor[2]["H"]),
+                                                    ],
+                                                ),
+                                                # Interactive Perceptual Color Wheel showing 304, 171, 193 positions
+                                                html.Div(
+                                                    style={
+                                                        "display": "flex",
+                                                        "alignItems": "center",
+                                                        "gap": "14px",
+                                                        "backgroundColor": "#000000",
+                                                        "border": "1px solid #2a2a2a",
+                                                        "borderRadius": "8px",
+                                                        "padding": "10px 12px",
+                                                        "marginBottom": "12px",
+                                                    },
+                                                    children=[
+                                                        html.Div(
+                                                            style={
+                                                                "position": "relative",
+                                                                "width": "136px",
+                                                                "height": "136px",
+                                                                "flexShrink": "0",
+                                                                "backgroundImage": f"url('{COLOR_WHEEL_URI}')",
+                                                                "backgroundSize": "cover",
+                                                                "borderRadius": "50%",
+                                                                "border": "1px solid #3a3a3a",
+                                                            },
+                                                            children=[
+                                                                html.Div(
+                                                                    style={
+                                                                        "position": "absolute",
+                                                                        "left": "50%",
+                                                                        "top": "50%",
+                                                                        "width": "6px",
+                                                                        "height": "6px",
+                                                                        "transform": "translate(-50%, -50%)",
+                                                                        "borderRadius": "50%",
+                                                                        "backgroundColor": "#fafafa",
+                                                                        "opacity": "0.6",
+                                                                    }
+                                                                ),
+                                                                html.Div(
+                                                                    init_triplet[0],
+                                                                    id="wheel-pin-0",
+                                                                    style=_wheel_pin_style(
+                                                                        init_anchor[0]["H"],
+                                                                        init_anchor[0]["C"],
+                                                                        lch_to_css_swatch(init_anchor[0]["L"], init_anchor[0]["C"], init_anchor[0]["H"]),
+                                                                    ),
+                                                                ),
+                                                                html.Div(
+                                                                    init_triplet[1],
+                                                                    id="wheel-pin-1",
+                                                                    style=_wheel_pin_style(
+                                                                        init_anchor[1]["H"],
+                                                                        init_anchor[1]["C"],
+                                                                        lch_to_css_swatch(init_anchor[1]["L"], init_anchor[1]["C"], init_anchor[1]["H"]),
+                                                                    ),
+                                                                ),
+                                                                html.Div(
+                                                                    init_triplet[2],
+                                                                    id="wheel-pin-2",
+                                                                    style=_wheel_pin_style(
+                                                                        init_anchor[2]["H"],
+                                                                        init_anchor[2]["C"],
+                                                                        lch_to_css_swatch(init_anchor[2]["L"], init_anchor[2]["C"], init_anchor[2]["H"]),
+                                                                    ),
+                                                                ),
+                                                            ],
                                                         ),
-                                                    ),
-                                                ],
-                                            ),
-                                            html.Div(
-                                                style={"fontSize": "11px", "color": "#d4d4d4", "lineHeight": "1.45"},
-                                                children=[
-                                                    html.Div(
-                                                        "Perceptual Oklch Color Wheel",
-                                                        style={"fontWeight": "700", "color": "#fafafa", "fontSize": "12px", "marginBottom": "4px"},
-                                                    ),
-                                                    html.Div("• Hue thumb picks the vivid color on the Hue track"),
-                                                    html.Div("• Chroma track grades Gray → that exact Hue color"),
-                                                    html.Div("• Luminance track grades Dark → Chroma thumb → Bright"),
-                                                ],
-                                            ),
-                                        ],
-                                    ),
-                                    _slider_row(
-                                        "Global Hue Shift (ΔH°)",
-                                        "global-h",
-                                        GLOBAL_H_MIN,
-                                        GLOBAL_H_MAX,
-                                        0.5,
-                                        0.0,
-                                        {-180: "-180°", -90: "-90°", 0: "0°", 90: "+90°", 180: "+180°"},
-                                        init_gh_grad,
-                                        init_gh_hue_color,
-                                    ),
-                                    _slider_row(
-                                        "Global Chroma / Saturation Multiplier (×C)",
-                                        "global-c",
-                                        GLOBAL_C_MIN,
-                                        GLOBAL_C_MAX,
-                                        0.01,
-                                        1.0,
-                                        {0.0: "0.0×", 0.5: "0.5×", 1.0: "1.0×", 1.5: "1.5×", 2.0: "2.0×"},
-                                        init_gc_grad,
-                                        init_g_swatch,
-                                    ),
-                                    _slider_row(
-                                        "Global Luminance / Lightness Multiplier (×L)",
-                                        "global-l",
-                                        GLOBAL_L_MIN,
-                                        GLOBAL_L_MAX,
-                                        0.01,
-                                        1.0,
-                                        {0.5: "0.5×", 1.0: "1.0×", 1.5: "1.5×", 2.0: "2.0×"},
-                                        init_gl_grad,
-                                        init_g_swatch,
-                                    ),
-                                ],
-                            ),
-                            # Option 2: Per-Waveband LCh Controls
-                            html.Details(
-                                open=True,
-                                style={
-                                    "backgroundColor": "#000000",
-                                    "border": "1px solid #2a2a2a",
-                                    "borderRadius": "8px",
-                                    "padding": "10px",
-                                    "marginBottom": "14px",
-                                },
-                                children=[
-                                    html.Summary(
-                                        "Option 2 — Per-Waveband LCh Controls (304 / 171 / 193 Å)",
-                                        style={
-                                            "fontWeight": "700",
-                                            "fontSize": "14px",
-                                            "color": "#fafafa",
-                                            "cursor": "pointer",
-                                            "marginBottom": "10px",
-                                        },
-                                    ),
-                                    html.Div(
-                                        "Each waveband defines one column of self.rgbmix. Sliders move automatically with Option 1 and Auto-Balance rules, and can also be fine-tuned individually.",
-                                        style={"fontSize": "11px", "color": "#d4d4d4", "marginBottom": "10px"},
-                                    ),
-                                    *wb_cards,
-                                ],
-                            ),
-                            # Sharpening & Structure (collapsible, like Option 2): per input channel, after the tone curve
-                            html.Details(
-                                open=True,
-                                style={
-                                    "backgroundColor": "#000000",
-                                    "border": "1px solid #2a2a2a",
-                                    "borderRadius": "8px",
-                                    "padding": "10px",
-                                    "marginBottom": "14px",
-                                },
-                                children=[
-                                    html.Summary(
-                                        "Sharpening & Structure",
-                                        style={"fontWeight": "700", "fontSize": "14px", "color": "#fafafa", "cursor": "pointer", "marginBottom": "10px"},
-                                    ),
-                                    html.Div(
-                                        "Applied to each input channel after the Tone Curve, before mixing (so the mix gets no color fringes). "
-                                        "Radii are in full-resolution pixels: fine sharpening is best judged on a quadrant (2× downsampled), since "
-                                        "the full-disk and half previews are downsampled 4×.",
-                                        style={"fontSize": "11px", "color": "#d4d4d4", "marginBottom": "10px"},
-                                    ),
-                                    html.Div(
-                                        "Structure — Multi-scale Gaussian Normalization (MGN)",
-                                        style={"fontSize": "12px", "fontWeight": "700", "color": "#e5e5e5", "marginBottom": "4px"},
-                                    ),
-                                    _slider_row(
-                                        "Structure (MGN weight; 0 = off)", "structure", 0.0, 0.2, 0.002, 0.0,
-                                        {0: "0", 0.05: "0.05", 0.1: "0.1", 0.15: "0.15", 0.2: "0.2"}, GRAY_TRACK, "#d4d4d4",
-                                    ),
-                                    html.Div(
-                                        "Sharpening — unsharp mask",
-                                        style={"fontSize": "12px", "fontWeight": "700", "color": "#e5e5e5", "margin": "4px 0"},
-                                    ),
-                                    _slider_row(
-                                        "Amount (0 = off)", "sharp-amount", 0.0, 3.0, 0.05, 0.0,
-                                        {0: "0", 1: "1", 2: "2", 3: "3"}, GRAY_TRACK, "#d4d4d4",
-                                    ),
-                                    _slider_row(
-                                        "Radius (full-res px)", "sharp-radius", 0.5, 4.0, 0.1, 1.0,
-                                        {0.5: "0.5", 1: "1", 2: "2", 3: "3", 4: "4"}, GRAY_TRACK, "#d4d4d4",
-                                    ),
-                                    _slider_row(
-                                        "Detail (halo allowance %; low = halo suppression)", "sharp-detail", 0.0, 100.0, 1.0, 25.0,
-                                        {0: "0", 25: "25", 50: "50", 75: "75", 100: "100"}, GRAY_TRACK, "#d4d4d4",
-                                    ),
-                                    _slider_row(
-                                        "Masking (edge mask %; 0 = sharpen everywhere)", "sharp-masking", 0.0, 100.0, 1.0, 0.0,
-                                        {0: "0", 25: "25", 50: "50", 75: "75", 100: "100"}, GRAY_TRACK, "#d4d4d4",
-                                    ),
-                                ],
+                                                        html.Div(
+                                                            style={"fontSize": "11px", "color": "#d4d4d4", "lineHeight": "1.45"},
+                                                            children=[
+                                                                html.Div(
+                                                                    "Perceptual Oklch Color Wheel",
+                                                                    style={"fontWeight": "700", "color": "#fafafa", "fontSize": "12px", "marginBottom": "4px"},
+                                                                ),
+                                                                html.Div("• Hue thumb picks the vivid color on the Hue track"),
+                                                                html.Div("• Chroma track grades Gray → that exact Hue color"),
+                                                                html.Div("• Luminance track grades Dark → Chroma thumb → Bright"),
+                                                            ],
+                                                        ),
+                                                    ],
+                                                ),
+                                                html.Div(
+                                                    style={"display": "flex", "alignItems": "center", "gap": "8px", "marginBottom": "10px"},
+                                                    children=[
+                                                        html.Span("Colorization", style={"fontSize": "12px", "fontWeight": "600", "color": "#d4d4d4", "flexShrink": "0"}),
+                                                        dcc.Dropdown(
+                                                            id="colormap-select",
+                                                            options=[{"label": "LCh color mix (sliders below)", "value": LCH_MIX}]
+                                                            + [{"label": f"{c} colormap", "value": c} for c in COLORMAP_CHOICES],
+                                                            value=LCH_MIX,
+                                                            clearable=False,
+                                                            searchable=False,
+                                                            style={"flex": "1", "minWidth": "0", "fontSize": "12px", "color": "#e5e5e5"},
+                                                        ),
+                                                    ],
+                                                    title="A sunpy colormap colorizes the mean of the shown input channels, exactly as the "
+                                                    "Input Channels previews (one channel shown alone at 1.0×: identical colors). In colormap mode, "
+                                                    "Global Luminance (×L) linearly stretches the intensity before the colormap; the other "
+                                                    "LCh sliders apply only to the LCh color mix.",
+                                                ),
+                                                _slider_row(
+                                                    "Global Hue Shift (ΔH°)",
+                                                    "global-h",
+                                                    GLOBAL_H_MIN,
+                                                    GLOBAL_H_MAX,
+                                                    0.5,
+                                                    0.0,
+                                                    {-180: "-180°", -90: "-90°", 0: "0°", 90: "+90°", 180: "+180°"},
+                                                    init_gh_grad,
+                                                    init_gh_hue_color,
+                                                ),
+                                                _slider_row(
+                                                    "Global Chroma / Saturation Multiplier (×C)",
+                                                    "global-c",
+                                                    GLOBAL_C_MIN,
+                                                    GLOBAL_C_MAX,
+                                                    0.01,
+                                                    1.0,
+                                                    {0.0: "0.0×", 0.5: "0.5×", 1.0: "1.0×", 1.5: "1.5×", 2.0: "2.0×"},
+                                                    init_gc_grad,
+                                                    init_g_swatch,
+                                                ),
+                                                _slider_row(
+                                                    "Global Luminance / Lightness Multiplier (×L)",
+                                                    "global-l",
+                                                    GLOBAL_L_MIN,
+                                                    GLOBAL_L_MAX,
+                                                    0.01,
+                                                    1.0,
+                                                    GLOBAL_L_MARKS,
+                                                    init_gl_grad,
+                                                    init_g_swatch,
+                                                ),
+                                            ],
+                                        ),
+                                        dcc.Tab(
+                                            label="Option 2 · Per-Waveband",
+                                            value="per-wb",
+                                            style=ADJUST_TAB_STYLE,
+                                            selected_style=ADJUST_TAB_SELECTED_STYLE,
+                                            children=[
+                                                html.Div(
+                                                    "Each waveband defines one column of self.rgbmix. Sliders move automatically with Option 1 and Auto-Balance rules, and can also be fine-tuned individually.",
+                                                    style={"fontSize": "11px", "color": "#d4d4d4", "marginBottom": "10px"},
+                                                ),
+                                                *wb_cards,
+                                            ],
+                                        ),
+                                    ],
+                                ),
                             ),
                             # Resulting self.rgbmix Python snippet
                             html.Div(
@@ -1986,10 +2134,6 @@ def create_dash_app(store: "FrameStore") -> Dash:
                                     html.Div(
                                         id="balance-metrics",
                                         style={"fontSize": "11px", "fontFamily": "monospace", "color": "#d4d4d4", "marginTop": "8px"},
-                                    ),
-                                    html.Div(
-                                        id="save-status",
-                                        style={"fontSize": "12px", "color": "#38bdf8", "marginTop": "6px"},
                                     ),
                                 ],
                             ),
@@ -2062,7 +2206,7 @@ def create_dash_app(store: "FrameStore") -> Dash:
                                 id="image-display-grid",
                                 style=_display_grid_style("side_by_side"),
                                 children=[
-                                    # Mix column: the mixed image with its Tone Curve panel right below it, so the
+                                    # Mix column: the mixed image with its Tone Curve / Sharpening tabs right below it, so the
                                     # panel spans the mix only (not the input-channels column).
                                     html.Div(
                                         id="modified-column",
@@ -2088,48 +2232,101 @@ def create_dash_app(store: "FrameStore") -> Dash:
                                                     ),
                                                 ],
                                             ),
-                                            # Tone panel (spans the mix column only): input gamma, then sigmoidal
-                                            # contrast to restore the mid-tone contrast that gamma flattens.
+                                            # Adjustment panels (span the mix column only), one at a time in tabs:
+                                            # Tone Curve (input gamma, then sigmoidal contrast to restore the mid-tone
+                                            # contrast that gamma flattens) and Sharpening & Structure (per input channel,
+                                            # after the tone curve). Both apply to each input channel before mixing.
                                             html.Div(
                                                 style={
                                                     "backgroundColor": "#111111",
                                                     "border": "1px solid #2a2a2a",
                                                     "borderRadius": "8px",
-                                                    "padding": "12px 16px 4px 16px",
+                                                    "padding": "0 16px 4px 16px",
                                                     "marginTop": "14px",
                                                 },
-                                                children=[
-                                                    html.Div(
-                                                        "Tone Curve (applied to each input channel before mixing)",
-                                                        style={"fontWeight": "700", "fontSize": "14px", "color": "#fafafa", "marginBottom": "8px"},
-                                                    ),
-                                                    _slider_row(
-                                                        "Gamma γ — lift faint structures (x → x^(1/γ))",
-                                                        "gamma",
-                                                        GAMMA_MIN,
-                                                        GAMMA_MAX,
-                                                        0.05,
-                                                        1.0,
-                                                        {0.5: "0.5", 1.0: "1.0", 1.5: "1.5", 2.0: "2.0", 2.5: "2.5", 3.0: "3.0"},
-                                                        gamma_track_gradient(),
-                                                        "#d4d4d4",
-                                                    ),
-                                                    _slider_row(
-                                                        "Contrast — sigmoidal S-curve, brightness-neutral per channel (0 = off)",
-                                                        "contrast",
-                                                        CONTRAST_MIN,
-                                                        CONTRAST_MAX,
-                                                        0.1,
-                                                        0.0,
-                                                        {0: "0", 3: "3", 6: "6", 9: "9", 12: "12"},
-                                                        contrast_track_gradient(),
-                                                        "#d4d4d4",
-                                                    ),
-                                                ],
+                                                children=dcc.Tabs(
+                                                    id="adjust-tabs",
+                                                    value="tone",
+                                                    style={"height": "38px", "marginBottom": "12px"},
+                                                    children=[
+                                                        dcc.Tab(
+                                                            label="Tone Curve",
+                                                            value="tone",
+                                                            style=ADJUST_TAB_STYLE,
+                                                            selected_style=ADJUST_TAB_SELECTED_STYLE,
+                                                            children=[
+                                                                _slider_row(
+                                                                    "Gamma γ — lift faint structures (x → x^(1/γ))",
+                                                                    "gamma",
+                                                                    GAMMA_MIN,
+                                                                    GAMMA_MAX,
+                                                                    0.05,
+                                                                    1.0,
+                                                                    {0.5: "0.5", 1.0: "1.0", 1.5: "1.5", 2.0: "2.0", 2.5: "2.5", 3.0: "3.0"},
+                                                                    gamma_track_gradient(),
+                                                                    "#d4d4d4",
+                                                                ),
+                                                                _slider_row(
+                                                                    "Contrast — sigmoidal S-curve, brightness-neutral per channel (0 = off)",
+                                                                    "contrast",
+                                                                    CONTRAST_MIN,
+                                                                    CONTRAST_MAX,
+                                                                    0.1,
+                                                                    0.0,
+                                                                    {0: "0", 3: "3", 6: "6", 9: "9", 12: "12"},
+                                                                    contrast_track_gradient(),
+                                                                    "#d4d4d4",
+                                                                ),
+                                                            ],
+                                                        ),
+                                                        dcc.Tab(
+                                                            label="Sharpening & Structure",
+                                                            value="sharpen",
+                                                            style=ADJUST_TAB_STYLE,
+                                                            selected_style=ADJUST_TAB_SELECTED_STYLE,
+                                                            children=[
+                                                                html.Div(
+                                                                    "Applied to each input channel after the Tone Curve, before mixing (so the mix gets no color fringes). "
+                                                                    "Radii are in full-resolution pixels: fine sharpening is best judged on a quadrant (2× downsampled), since "
+                                                                    "the full-disk and half previews are downsampled 4×.",
+                                                                    style={"fontSize": "11px", "color": "#d4d4d4", "marginBottom": "10px"},
+                                                                ),
+                                                                html.Div(
+                                                                    "Structure — Multi-scale Gaussian Normalization (MGN)",
+                                                                    style={"fontSize": "12px", "fontWeight": "700", "color": "#e5e5e5", "marginBottom": "4px"},
+                                                                ),
+                                                                _slider_row(
+                                                                    "Structure (MGN weight; 0 = off)", "structure", 0.0, 0.2, 0.002, 0.0,
+                                                                    {0: "0", 0.05: "0.05", 0.1: "0.1", 0.15: "0.15", 0.2: "0.2"}, GRAY_TRACK, "#d4d4d4",
+                                                                ),
+                                                                html.Div(
+                                                                    "Sharpening — unsharp mask",
+                                                                    style={"fontSize": "12px", "fontWeight": "700", "color": "#e5e5e5", "margin": "4px 0"},
+                                                                ),
+                                                                _slider_row(
+                                                                    "Amount (0 = off)", "sharp-amount", 0.0, 3.0, 0.05, 0.0,
+                                                                    {0: "0", 1: "1", 2: "2", 3: "3"}, GRAY_TRACK, "#d4d4d4",
+                                                                ),
+                                                                _slider_row(
+                                                                    "Radius (full-res px)", "sharp-radius", 0.5, 4.0, 0.1, 1.0,
+                                                                    {0.5: "0.5", 1: "1", 2: "2", 3: "3", 4: "4"}, GRAY_TRACK, "#d4d4d4",
+                                                                ),
+                                                                _slider_row(
+                                                                    "Detail (halo allowance %; low = halo suppression)", "sharp-detail", 0.0, 100.0, 1.0, 25.0,
+                                                                    {0: "0", 25: "25", 50: "50", 75: "75", 100: "100"}, GRAY_TRACK, "#d4d4d4",
+                                                                ),
+                                                                _slider_row(
+                                                                    "Masking (edge mask %; 0 = sharpen everywhere)", "sharp-masking", 0.0, 100.0, 1.0, 0.0,
+                                                                    {0: "0", 25: "25", 50: "50", 75: "75", 100: "100"}, GRAY_TRACK, "#d4d4d4",
+                                                                ),
+                                                            ],
+                                                        ),
+                                                    ],
+                                                ),
                                             ),
                                         ],
                                     ),
-                                    # Input Channels Card: 304 / 171 / 193 each in its sunpy SDO/AIA colormap
+                                    # Input Channels Card: each selected channel (AIA or HMI) in its sunpy SDO colormap
                                     html.Div(
                                         id="default-card",
                                         style={
@@ -2141,7 +2338,7 @@ def create_dash_app(store: "FrameStore") -> Dash:
                                         },
                                         children=[
                                             html.Div(
-                                                "Input Channels (sunpy SDO/AIA colormaps)",
+                                                "Input Channels (sunpy SDO colormaps)",
                                                 style={"fontSize": "13px", "fontWeight": "600", "color": "#d4d4d4", "marginBottom": "8px"},
                                             ),
                                             html.Div(
@@ -2235,6 +2432,25 @@ def create_dash_app(store: "FrameStore") -> Dash:
     # directly on each slider wrapper so the slider rides directly ON its colorbar.
     # -------------------------------------------------------------------------
     @app.callback(
+        Output("global-l", "max"),
+        Output("global-l", "marks"),
+        Output("global-l", "value", allow_duplicate=True),
+        Input("colormap-select", "value"),
+        *[Input(f"ch-select-{k}", "value") for k in range(3)],
+        *[Input(f"ch-eye-{k}", "n_clicks") for k in range(3)],
+        State("global-l", "value"),
+        prevent_initial_call=True,
+    )
+    def global_l_range(colormap, ch0, ch1, ch2, eye0, eye1, eye2, gl):
+        """Global Luminance reaches COLORMAP_L_MAX in colormap mode or when one channel is shown (a linear
+        stretch, see single_channel_gain); otherwise a larger value is brought down to GLOBAL_L_MAX."""
+        single = colormap_weights([norm_wavel(w) for w in (ch0, ch1, ch2)], visibility_mask(eye0, eye1, eye2)).sum() == 1
+        stretch = single or colormap not in (None, LCH_MIX)
+        l_max, marks = (COLORMAP_L_MAX, COLORMAP_L_MARKS) if stretch else (GLOBAL_L_MAX, GLOBAL_L_MARKS)
+        value = l_max if float(gl or 1.0) > l_max else no_update
+        return l_max, _format_dark_marks(marks), value
+
+    @app.callback(
         Output("wb-0-h", "value"),
         Output("wb-0-c", "value"),
         Output("wb-0-l", "value"),
@@ -2321,6 +2537,7 @@ def create_dash_app(store: "FrameStore") -> Dash:
         Input("ch-eye-2", "n_clicks"),
         Input("source-select", "value"),
         Input("frame-slider", "value"),
+        Input("colormap-select", "value"),
         *[Input(sid, "value") for sid in ENHANCE_SLIDER_IDS],
         State("mixer-state-store", "data"),
         State("preset-upload", "filename"),
@@ -2356,6 +2573,7 @@ def create_dash_app(store: "FrameStore") -> Dash:
         eye2,
         source_name,
         frame,
+        colormap,
         structure,
         sh_amount,
         sh_radius,
@@ -2381,11 +2599,7 @@ def create_dash_app(store: "FrameStore") -> Dash:
         anchor_wb = copy.deepcopy(store_data["anchor_wb"])
         last_synced_wb = copy.deepcopy(store_data["last_synced_wb"])
 
-        current_wb_inputs = [
-            {"H": round(float(w0h), 1), "C": round(float(w0c), 3), "L": round(float(w0l), 3)},
-            {"H": round(float(w1h), 1), "C": round(float(w1c), 3), "L": round(float(w1l), 3)},
-            {"H": round(float(w2h), 1), "C": round(float(w2c), 3), "L": round(float(w2l), 3)},
-        ]
+        current_wb_inputs = [round_wb(w0h, w0c, w0l), round_wb(w1h, w1c, w1l), round_wb(w2h, w2c, w2l)]
 
         if isinstance(trigger, str) and trigger.startswith("wb-") and current_wb_inputs == last_synced_wb:
             return (no_update,) * len(ctx.outputs_list)
@@ -2406,18 +2620,17 @@ def create_dash_app(store: "FrameStore") -> Dash:
         update_global_sliders = False
         clear_upload = no_update
 
+        tag = store_data.get("preset_tag")
         loaded = None
+        loaded_tag = None
         loaded_wb = None  # exact Option 2 values to restore (cache); presets rebuild them from anchor + global
         loaded_from = upload_filename
         if trigger == "cache-load-store" and cache_load:
             try:
                 loaded = parse_preset(cache_load["preset"])
-                loaded_wb = [
-                    {"H": float(w["H"]) % 360.0, "C": float(np.clip(float(w["C"]), WB_C_MIN, WB_C_MAX)),
-                     "L": float(np.clip(float(w["L"]), WB_L_MIN, WB_L_MAX))}
-                    for w in cache_load["preset"]["option2_wavebands"]
-                ]
+                loaded_wb = [round_wb(w["H"], w["C"], w["L"]) for w in cache_load["preset"]["option2_wavebands"]]
                 loaded_from = os.path.relpath(CACHE_FILE, PROJECT_DIR)
+                loaded_tag = cache_load["preset"].get("settings", {}).get("preset_tag")
             except (ValueError, KeyError, TypeError) as exc:
                 desc_out = f"Could not load cached settings: {exc}"
         elif trigger == "preset-upload" and upload_contents:
@@ -2425,17 +2638,20 @@ def create_dash_app(store: "FrameStore") -> Dash:
             try:
                 _, b64 = upload_contents.split(",", 1)
                 loaded = parse_preset(json.loads(base64.b64decode(b64).decode("utf-8")))
+                loaded_tag = preset_tag(upload_filename)
             except (ValueError, KeyError, TypeError, json.JSONDecodeError, UnicodeDecodeError) as exc:
                 desc_out = f"Could not load preset '{upload_filename}': {exc}"
 
         if loaded is not None:
             anchor_wb, (gh, gc, gl) = loaded
+            tag = loaded_tag
             wb_lch = loaded_wb or apply_global_to_anchor(anchor_wb, gh, gc, gl)
             last_synced_wb = copy.deepcopy(wb_lch)
             update_wb_sliders = True
             update_global_sliders = True
             desc_out = f"Loaded preset '{loaded_from}' (Option 1 & Option 2 sliders)."
         elif trigger in preset_map:
+            tag = None
             preset = data.presets_for(tp)[preset_map[trigger]]
             anchor_wb = apply_global_to_anchor(preset["wb_lch"], 0.0, 1.0, 1.0)
             wb_lch = copy.deepcopy(anchor_wb)
@@ -2445,17 +2661,23 @@ def create_dash_app(store: "FrameStore") -> Dash:
             update_global_sliders = True
             desc_out = preset["desc"]
         elif trigger == "btn-reset-global":
+            tag = None
             wb_lch = apply_global_to_anchor(anchor_wb, 0.0, 1.0, 1.0)
             last_synced_wb = copy.deepcopy(wb_lch)
             gh, gc, gl = 0.0, 1.0, 1.0
             update_wb_sliders = True
             update_global_sliders = True
         elif trigger in {"global-h", "global-c", "global-l"}:
+            tag = None
             wb_lch = apply_global_to_anchor(anchor_wb, float(gh), float(gc), float(gl))
             last_synced_wb = copy.deepcopy(wb_lch)
             update_wb_sliders = True
         elif isinstance(trigger, str) and trigger.startswith("wb-"):
+            tag = None  # unchanged values returned early above
             wb_lch = current_wb_inputs
+            # a typed value with more decimals (e.g. 0.341) is shown rounded in its slider too
+            raw = [float(v) for v in (w0h, w0c, w0l, w1h, w1c, w1l, w2h, w2c, w2l)]
+            update_wb_sliders = any(abs(r - w[k]) > 1e-9 for r, (w, k) in zip(raw, ((w, k) for w in wb_lch for k in "HCL")))
             for i in range(3):
                 if abs(wb_lch[i]["H"] - last_synced_wb[i]["H"]) > 1e-3:
                     anchor_wb[i]["H"] = float((wb_lch[i]["H"] - float(gh)) % 360.0)
@@ -2471,12 +2693,15 @@ def create_dash_app(store: "FrameStore") -> Dash:
         # Hidden channels are dropped from what is displayed only (their rgbmix column is zeroed);
         # sliders, anchors and the exported matrix are left untouched, so un-hiding restores the mix.
         visible = visibility_mask(eye0, eye1, eye2)
-        shown_mix = rgbmix * visible
-        mod_uri = data.render_uri(view_name, shown_mix, tp)
+        weights = colormap_weights(data.triplet, visible)
+        lch_gain = single_channel_gain(anchor_wb, wb_lch, float(gl), weights)
+        shown_mix = rgbmix * visible * lch_gain
+        cmap = None if colormap in (None, LCH_MIX) else colormap
+        mod_uri = data.render_uri(view_name, shown_mix, tp, cmap=cmap, weights=weights, gain=float(gl))
         if ctx.triggered_id is not None:  # skip the page-load call: it would overwrite the cache with defaults
             write_settings_cache(
                 anchor_wb, wb_lch, float(gh), float(gc), float(gl), tuple(norm_wavel(w) for w in (ch0, ch1, ch2)),
-                tp, visible, view_name,
+                tp, visible, view_name, tag,
             )
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
 
@@ -2507,9 +2732,11 @@ def create_dash_app(store: "FrameStore") -> Dash:
             f"self.structure = {tp.structure:.3f}\n"
             f"self.sharpen = ({tp.amount:.2f}, {tp.radius:.1f}, {tp.detail:.0f}, {tp.masking:.0f})  # amount, radius, detail, masking"
         )
-        hidden = [f"{w} Å" for w, v in zip(data.triplet, visible) if w and not v]
+        hidden = [channel_label(w) for w, v in zip(data.triplet, visible) if w and not v]
         if hidden:
             code_str += f"\n# preview currently hides {', '.join(hidden)} (matrix above is the full mix)"
+        if lch_gain != 1.0:
+            code_str += f"\n# preview brightness gain ×{lch_gain:.2f} (Global ×L beyond the Option 2 L maximum)"
 
         mets = mix_metrics(shown_mix, sample_px)
         p995 = mets["p995"]
@@ -2525,7 +2752,7 @@ def create_dash_app(store: "FrameStore") -> Dash:
         _, grad_gc, grad_gl, g_swatch = make_triplet_gradients_and_swatch(
             0.0, GLOBAL_H_MIN, GLOBAL_H_MAX,
             float(gc), GLOBAL_C_MIN, GLOBAL_C_MAX, 1.0,
-            float(gl), GLOBAL_L_MIN, GLOBAL_L_MAX, 1.0,
+            float(gl), GLOBAL_L_MIN, GLOBAL_L_MAX if cmap is None and weights.sum() != 1 else COLORMAP_L_MAX, 1.0,
             h_offset=sun_h,
         )
         gh_vivid_cursor = _rgb_vec_to_css(vivid_rgb_at_hue(sun_h))
@@ -2588,14 +2815,14 @@ def create_dash_app(store: "FrameStore") -> Dash:
             f"{float(gc):.2f}×",
             f"{float(gl):.2f}×",
             f"{wb_lch[0]['H']:.1f}°",
-            f"{wb_lch[0]['C']:.3f}",
-            f"{wb_lch[0]['L']:.3f}",
+            f"{wb_lch[0]['C']:.2f}",
+            f"{wb_lch[0]['L']:.2f}",
             f"{wb_lch[1]['H']:.1f}°",
-            f"{wb_lch[1]['C']:.3f}",
-            f"{wb_lch[1]['L']:.3f}",
+            f"{wb_lch[1]['C']:.2f}",
+            f"{wb_lch[1]['L']:.2f}",
             f"{wb_lch[2]['H']:.1f}°",
-            f"{wb_lch[2]['C']:.3f}",
-            f"{wb_lch[2]['L']:.3f}",
+            f"{wb_lch[2]['C']:.2f}",
+            f"{wb_lch[2]['L']:.2f}",
             {
                 "width": "22px",
                 "height": "22px",
@@ -2613,7 +2840,7 @@ def create_dash_app(store: "FrameStore") -> Dash:
             _slider_wrap_style(grad_gc, g_swatch),
             _slider_wrap_style(grad_gl, g_swatch),
             *wb_wraps,
-            {"anchor_wb": anchor_wb, "last_synced_wb": last_synced_wb},
+            {"anchor_wb": anchor_wb, "last_synced_wb": last_synced_wb, "preset_tag": tag},
             clear_upload,
         )
 
@@ -2646,7 +2873,7 @@ def create_dash_app(store: "FrameStore") -> Dash:
         frame_cache = store.get(source_name, frame)
         out = []
         for k, wavel in enumerate(norm_wavel(w) for w in (ch0, ch1, ch2)):
-            name = f"{wavel} Å" if wavel else "Empty slot"
+            name = channel_label(wavel) if wavel else "Empty slot"
             out += [
                 frame_cache.channel_uri(wavel, view_name) if wavel else EMPTY_CHANNEL_URI,
                 channel_caption(k, wavel),
@@ -2674,13 +2901,17 @@ def create_dash_app(store: "FrameStore") -> Dash:
         Output("frame-slider", "disabled"),
         Output("frame-row", "style"),
         Input("source-select", "value"),
+        Input("frame-request", "data"),
         prevent_initial_call=True,
     )
-    def on_source_change(source_name):
+    def on_source_change(source_name, request):
         src = store.source(source_name)
         opts = channel_options(src)
         trip = [w or EMPTY_SLOT for w in default_triplet(src)]
-        return (opts, opts, opts, *trip, max(src.n_frames - 1, 1), 0, frame_marks(src), src.n_frames < 2, frame_row_style(src))
+        # Get Data asks for a given frame of the (new or updated) source; a manual source change starts at frame 0
+        requested = "frame-request.data" in ctx.triggered_prop_ids and request and request.get("source") == src.name
+        frame = int(np.clip(request["frame"], 0, src.n_frames - 1)) if requested else 0
+        return (opts, opts, opts, *trip, max(src.n_frames - 1, 1), frame, frame_marks(src), src.n_frames < 2, frame_row_style(src))
 
     # ◀ / ▶ step one frame (typing in the slider's box applies when it loses focus).
     @app.callback(
@@ -2830,36 +3061,49 @@ def create_dash_app(store: "FrameStore") -> Dash:
         State("source-select", "value"),
         State("frame-slider", "value"),
         *[State(sid, "value") for sid in ENHANCE_SLIDER_IDS],
+        State("colormap-select", "value"),
+        State("global-l", "value"),
+        State("mixer-state-store", "data"),
     ]
 
     def read_save_settings(vals):
-        """SAVE_STATES values -> (source, frame, triplet, rgbmix, tone params); None triplet if all slots empty."""
+        """SAVE_STATES values -> (source, frame, triplet, rgbmix, tone params, file name stem, colorize), colorize
+        being (colormap name, colormap_weights, Global Luminance gain) in colormap mode, else None (LCh mix)."""
         wb, chans = vals[0:9], vals[9:12]
         gamma, contrast = vals[12:14]
-        eyes, (source_name, frame), enhance = vals[14:17], vals[17:19], vals[19:]
+        eyes, (source_name, frame), enhance = vals[14:17], vals[17:19], vals[19:-3]
+        colormap, gl, store_data = vals[-3], vals[-2], vals[-1]
         src = store.source(source_name)
         triplet = tuple(norm_wavel(w) for w in chans)
         tp = make_tone_params(gamma, contrast, *enhance)
         wb_lch = [{"H": float(wb[3 * k]), "C": float(wb[3 * k + 1]), "L": float(wb[3 * k + 2])} for k in range(3)]
         visible = visibility_mask(*eyes)
-        rgbmix = lch_to_rgbmix(wb_lch) * visible  # save what the preview shows (hidden channels left out)
+        weights = colormap_weights(triplet, visible)
+        # save what the preview shows (hidden channels left out, single-channel brightness gain applied)
+        rgbmix = lch_to_rgbmix(wb_lch) * visible * single_channel_gain((store_data or {})["anchor_wb"], wb_lch, float(gl or 1.0), weights)
         hidden = "".join(f"_hide{w}" for w, v in zip(triplet, visible) if w and not v)
-        return src, int(frame or 0), triplet, rgbmix, tp, hidden
+        colorize = None if colormap in (None, LCH_MIX) else (colormap, weights, float(gl or 1.0))
+        stem = output_stem(triplet, hidden, tp, (store_data or {}).get("preset_tag"), colorize and (colorize[0], colorize[2]))
+        return src, int(frame or 0), triplet, rgbmix, tp, stem, colorize
 
-    def output_stem(triplet, hidden, tp) -> str:
-        """File name stem: channels, hidden channels and tone curve (sharpening goes in the sub-folder name)."""
-        return f"im_custom_lch_jp2_{'_'.join(w or 'none' for w in triplet)}{hidden}_gamma{tp.gamma:.2f}_contrast{tp.contrast:.1f}"
+    def output_stem(triplet, hidden, tp, tag, cmap=None) -> str:
+        """File name stem: channels, hidden channels, tone curve (sharpening goes in the sub-folder name), then
+        the loaded preset's name, or the save time when no preset is loaded, so different colors never overwrite."""
+        colors = tag or time.strftime("saved%Y%m%d_%H%M%S")
+        if cmap:  # colormap mode: the LCh sliders and presets play no part
+            return f"im_{cmap[0]}_x{cmap[1]:.2f}_jp2_{'_'.join(w or 'none' for w in triplet)}{hidden}_gamma{tp.gamma:.2f}_contrast{tp.contrast:.1f}"
+        return f"im_custom_lch_jp2_{'_'.join(w or 'none' for w in triplet)}{hidden}_gamma{tp.gamma:.2f}_contrast{tp.contrast:.1f}_{colors}"
 
-    def output_dir_for(src, tp, view_name) -> str:
-        """<output_dir>/<sharpening sub-folder>/<region>, e.g. mgn0.050_amt1.00_rad1.0_det25_msk0/Q2, or
-        sharp_off/full-disk."""
+    def output_dir_for(src, tp, view_name, kind) -> str:
+        """<source folder>/<kind>/<sharpening sub-folder>/<region>, kind SNAPSHOTS_DIR or BATCHES_DIR, e.g.
+        rgb_batches/mgn0.050_amt1.00_rad1.0_det25_msk0/Q2, or rgb_snapshots/sharp_off/full-disk."""
         parts = []
         if tp.structure > 1e-6:
             parts.append(f"mgn{tp.structure:.3f}")
         if tp.amount > 1e-6:
             parts += [f"amt{tp.amount:.2f}", f"rad{tp.radius:.1f}", f"det{tp.detail:.0f}", f"msk{tp.masking:.0f}"]
         region = view_name if view_name in REGIONS else DEFAULT_VIEW
-        return os.path.join(src.output_dir, "_".join(parts) or "sharp_off", region)
+        return os.path.join(src.root_dir, kind, "_".join(parts) or "sharp_off", region)
 
     def frame_pivots(src, frame, triplet, tp):
         """Contrast pivots and sharpening mask thresholds the preview uses for this frame."""
@@ -2867,12 +3111,13 @@ def create_dash_app(store: "FrameStore") -> Dash:
         mask_thr = td.mask_thresholds(tp) if tp.amount > 0 and tp.masking > 0 else None
         return tuple(td.contrast_mid(tp.gamma, tp.contrast)), mask_thr
 
-    def write_full_res(src, frame, triplet, rgbmix, tp, mids, mask_thr, view_name, out_dir, stem) -> tuple[str, tuple]:
+    def write_full_res(src, frame, triplet, rgbmix, tp, mids, mask_thr, view_name, out_dir, stem, colorize=None) -> tuple[str, tuple]:
         """Render the selected region of one frame at full resolution and write it as JPEG; returns
         (path, (width, height)).
 
         Same pipeline as RGBMixer/process_rgb_image for jp2 (visualization.scale_rgb, then RGB -> BGR),
-        with the fixed 0..255 input range the preview uses, and all-zero inputs for empty slots."""
+        with the fixed 0..255 input range the preview uses, and all-zero inputs for empty slots. With `colorize`
+        (colormap name, weights, gain), the processed inputs are colorized as in the preview's colormap mode."""
         files = src.files_for(frame)
         raw = [visualization.load_jp2(files[w]) if w else None for w in triplet]
         shape = next(r.shape for r in raw if r is not None)
@@ -2880,11 +3125,15 @@ def create_dash_app(store: "FrameStore") -> Dash:
         padded, inner = region_slices(view_name)
         raw = [r[padded] for r in raw]
         im = visualization.scale_rgb(
-            raw, np.zeros(3), np.full(3, 255.0), gamma_rgb=(tp.gamma,) * 3, rgbmix=rgbmix,
+            raw, np.zeros(3), np.full(3, 255.0), gamma_rgb=(tp.gamma,) * 3, rgbmix=None if colorize else rgbmix,
             contrast=tp.contrast, contrast_mid=mids, structure=tp.structure, sharpen=tp.sharpen,
             sharpen_mask_thr=mask_thr,
         )
-        bgr = np.ascontiguousarray(np.clip(np.flip(im[inner], axis=2), 0, 255).astype(np.uint8))
+        if colorize:
+            cmap, weights, gain = colorize
+            bgr = np.ascontiguousarray(colormap_bgr_u8(colormap_input(im[inner] / np.float32(255.0), weights, gain), cmap))
+        else:
+            bgr = np.ascontiguousarray(np.clip(np.flip(im[inner], axis=2), 0, 255).astype(np.uint8))
         suffix = src.frame_times[frame] if src.is_event else "0000"
         os.makedirs(out_dir, exist_ok=True)
         out_path = os.path.join(out_dir, f"{stem}_{suffix}.jpeg")
@@ -2892,20 +3141,19 @@ def create_dash_app(store: "FrameStore") -> Dash:
         return out_path, (bgr.shape[1], bgr.shape[0])
 
     @app.callback(
-        Output("save-status", "children"),
+        Output("batch-status", "children", allow_duplicate=True),
         Input("btn-save-full", "n_clicks"),
         State("view-select", "data"),
         *SAVE_STATES,
         prevent_initial_call=True,
     )
     def save_full_res(_n_clicks, view_name, *vals):
-        src, frame, triplet, rgbmix, tp, hidden = read_save_settings(vals)
+        src, frame, triplet, rgbmix, tp, stem, colorize = read_save_settings(vals)
         if all(w is None for w in triplet):
             return "Nothing to save: all R/G/B slots are empty."
         mids, mask_thr = frame_pivots(src, frame, triplet, tp)
         out_path, (w, h) = write_full_res(
-            src, frame, triplet, rgbmix, tp, mids, mask_thr, view_name, output_dir_for(src, tp, view_name),
-            output_stem(triplet, hidden, tp),
+            src, frame, triplet, rgbmix, tp, mids, mask_thr, view_name, output_dir_for(src, tp, view_name, SNAPSHOTS_DIR), stem, colorize,
         )
         return f"Saved full-resolution {w}×{h} image to: {out_path}"
 
@@ -2950,7 +3198,7 @@ def create_dash_app(store: "FrameStore") -> Dash:
         except (ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
             return (no_update,) * n_out + (f"Could not read {os.path.relpath(CACHE_FILE, PROJECT_DIR)}: {exc}",)
         missing = [w for w, c in zip(st["channels_rgb"], chans) if c is no_update]
-        note = f" ({', '.join(missing)} Å not in this data source: kept current channel)" if missing else ""
+        note = f" ({', '.join(channel_label(w) for w in missing)} not in this data source: kept current channel)" if missing else ""
         status = f"Loaded the latest settings (cached {cached.get('info', {}).get('saved_utc', '?')}){note}"
         return (
             {"preset": cached, "nonce": time.time()}, *chans, *eyes, *values,
@@ -2963,13 +3211,13 @@ def create_dash_app(store: "FrameStore") -> Dash:
     # faster than a process pool here (no pickling or worker start-up). Each frame holds ~1 GB of float arrays.
     BATCH_WORKERS = min(8, os.cpu_count() or 1)
 
-    def run_batch(src, triplet, rgbmix, tp, mids, mask_thr, out_dir, stem, view_name):
+    def run_batch(src, triplet, rgbmix, tp, mids, mask_thr, out_dir, stem, view_name, colorize):
         t0 = time.time()
         lock = threading.Lock()
         try:
             def one(frame):
                 if not batch["cancel"].is_set():
-                    write_full_res(src, frame, triplet, rgbmix, tp, mids, mask_thr, view_name, out_dir, stem)
+                    write_full_res(src, frame, triplet, rgbmix, tp, mids, mask_thr, view_name, out_dir, stem, colorize)
                     with lock:
                         batch["done"] += 1
 
@@ -2980,7 +3228,7 @@ def create_dash_app(store: "FrameStore") -> Dash:
                 return
             msg = f"Batch done: {src.n_frames} frames in {time.time() - t0:.0f} s → {out_dir}"
             batch["msg"] = msg + " · encoding movie…"
-            event_dir = os.path.dirname(src.output_dir)
+            event_dir = src.root_dir
             settings_dir, region = os.path.split(out_dir)
             movie_name = f"movie_{stem}_{os.path.basename(settings_dir)}_{region}"
             # the frames are already cropped to the region: only scale them (longest side 1024 px)
@@ -3007,7 +3255,7 @@ def create_dash_app(store: "FrameStore") -> Dash:
             if running:
                 batch["cancel"].set()
                 return "Cancelling batch…", False, "Save Batch"
-            src, frame, triplet, rgbmix, tp, hidden = read_save_settings(vals)
+            src, frame, triplet, rgbmix, tp, stem, colorize = read_save_settings(vals)
             if not src.is_event:
                 return "Save Batch needs an event folder (select one under Data Source).", True, "Save Batch"
             if all(w is None for w in triplet):
@@ -3018,7 +3266,7 @@ def create_dash_app(store: "FrameStore") -> Dash:
             batch.update(cancel=threading.Event(), done=0, total=src.n_frames, msg="")
             batch["thread"] = threading.Thread(
                 target=run_batch, daemon=True,
-                args=(src, triplet, rgbmix, tp, mids, mask_thr, output_dir_for(src, tp, view_name), output_stem(triplet, hidden, tp), view_name),
+                args=(src, triplet, rgbmix, tp, mids, mask_thr, output_dir_for(src, tp, view_name, BATCHES_DIR), stem, view_name, colorize),
             )
             batch["thread"].start()
             running = True
@@ -3027,18 +3275,177 @@ def create_dash_app(store: "FrameStore") -> Dash:
             return status, False, "Cancel Batch"
         return batch["msg"], True, "Save Batch"
 
+    # ---- Get Data: single date/time or date range from Helioviewer (background thread, polled) ----
+    @app.callback(
+        Output("dl-end-row", "style"),
+        Input("dl-range", "value"),
+    )
+    def toggle_end_row(range_on):
+        return date_row_style("range" in (range_on or []))
+
+    @app.callback(
+        Output("dl-start-row", "className", allow_duplicate=True),
+        *[Input(f"dl-start-{part}", "value") for part, _, _ in DATE_PARTS],
+        prevent_initial_call=True,
+    )
+    def clear_date_warning(*_):
+        return "date-row"  # a new date clears the red "closest image is far" warning
+
+    dl = {"thread": None, "cancel": threading.Event(), "done": 0, "total": 0, "msg": "", "warn": False, "result": None}
+
+    def register_event(event_dir) -> "DataSource | None":
+        src = event_source(str(event_dir))
+        if src is not None:
+            store.add_source(src)
+        return src
+
+    def frame_of(src: DataSource, dt: datetime) -> int:
+        return next((i for i, t in enumerate(src.frame_times) if frame_datetime(t) == dt), 0)
+
+    def run_single(dt: datetime, channels: list):
+        try:
+            dl["msg"] = f"Looking up the closest images to {dt:%Y-%m-%d %H:%M} UTC…"
+            actual = get_data.closest_image_dates(dt, channels)
+            ref = min(actual.values(), key=lambda a: abs(a - dt))  # the frame is stamped with the best-matching channel's time
+            far = {w: a for w, a in actual.items() if abs(a - dt) > CLOSEST_WARN_GAP}
+            if far:
+                dl["warn"] = True
+                note = (f"No image within {CLOSEST_WARN_GAP.seconds // 60} min of {dt:%Y-%m-%d %H:%M} UTC. Actual: "
+                        + ", ".join(f"{channel_label(w)} {a:%Y-%m-%d %H:%M:%S}" for w, a in actual.items()) + " UTC")
+            else:
+                note = f"Closest image: {ref:%Y-%m-%d %H:%M:%S} UTC"
+            hit = find_local_frame(store.sources.values(), ref, channels)
+            if hit is not None:
+                dl["result"] = {"source": hit[0], "frame": hit[1], "updated": False}
+                dl["msg"] = f"{note} · already in {hit[0]}"
+                return
+            dl["msg"] = f"{note} · downloading…"
+            event_dir = get_data.download_sdo_jp2(
+                ref, ref, channels, base_dir=data_dir, progress=dl_progress, cancel=dl["cancel"],
+            )
+            src = register_event(event_dir)
+            if dl["cancel"].is_set() or src is None:
+                dl["msg"] = f"{note} · download cancelled."
+                return
+            dl["result"] = {"source": src.name, "frame": frame_of(src, ref.replace(microsecond=0)), "updated": True}
+            dl["msg"] = f"{note} · saved to {event_dir}"
+        except Exception as exc:  # report in the UI instead of dying silently in the thread
+            dl["msg"], dl["warn"] = f"Download failed: {exc}", True
+
+    def run_range(start: datetime, end: datetime, channels: list):
+        try:
+            event_dir = get_data.download_sdo_jp2(
+                start, end, channels, cadence=DOWNLOAD_CADENCE, base_dir=data_dir,
+                progress=dl_progress, cancel=dl["cancel"],
+            )
+            src = register_event(event_dir)
+            if dl["cancel"].is_set():
+                dl["msg"] = f"Download cancelled after {dl['done']} / {dl['total']} files (kept in {event_dir}; Get Data again resumes)."
+                if src is not None:
+                    dl["result"] = {"source": src.name, "frame": 0, "updated": True}
+                return
+            dl["result"] = {"source": src.name, "frame": 0, "updated": True} if src is not None else None
+            dl["msg"] = f"Downloaded {src.n_frames if src else 0} frames to {event_dir}"
+        except Exception as exc:
+            dl["msg"], dl["warn"] = f"Download failed after {dl['done']} files: {exc}", True
+
+    def dl_progress(done, total):
+        dl["done"], dl["total"] = done, total
+        dl["msg"] = f"Downloading / copying {done} / {total} files…"
+
+    def start_job(target, *args):
+        dl.update(cancel=threading.Event(), done=0, total=0, msg="Starting…", warn=False, result=None)
+        dl["thread"] = threading.Thread(target=target, args=args, daemon=True)
+        dl["thread"].start()
+
+    def source_options():
+        return [{"label": src.label, "value": name} for name, src in store.sources.items()]
+
+    @app.callback(
+        Output("dl-status", "children"),
+        Output("dl-status", "style"),
+        Output("dl-poll", "disabled"),
+        Output("btn-get-data", "children"),
+        Output("source-select", "options"),
+        Output("source-select", "value"),
+        Output("frame-request", "data"),
+        Output("frame-slider", "value", allow_duplicate=True),
+        Output("dl-start-row", "className", allow_duplicate=True),
+        Input("btn-get-data", "n_clicks"),
+        Input("dl-poll", "n_intervals"),
+        State("dl-range", "value"),
+        State("dl-channels", "value"),
+        State("dl-hmi-channels", "value"),
+        *[State(f"dl-start-{part}", "value") for part, _, _ in DATE_PARTS],
+        *[State(f"dl-end-{part}", "value") for part, _, _ in DATE_PARTS],
+        State("source-select", "value"),
+        prevent_initial_call=True,
+    )
+    def get_data_cb(_n_clicks, _n_intervals, range_on, channels, hmi_channels, *vals):
+        n = len(DATE_PARTS)
+        start_vals, end_vals, current = vals[:n], vals[n:2 * n], vals[2 * n]
+        running = dl["thread"] is not None and dl["thread"].is_alive()
+        keep = (no_update,) * 4
+
+        def show(source, frame, updated):
+            """Outputs selecting `frame` of `source`: a new / updated source goes through on_source_change."""
+            if source == current and not updated:
+                return no_update, no_update, no_update, frame
+            return source_options(), source, {"source": source, "frame": frame}, no_update
+
+        def status(msg, warn=False, poll=False):
+            return msg, dl_status_style(warn), not poll, "Cancel" if poll else "Get Data"
+
+        if ctx.triggered_id == "btn-get-data":
+            if running:
+                dl["cancel"].set()
+                return (*status("Cancelling download…", poll=True), *keep, no_update)
+            ticked = (channels or []) + (hmi_channels or [])
+            channels = [w for w in (*DOWNLOAD_CHANNEL_CHOICES, *HMI_CHANNELS) if w in ticked]
+            if not channels:
+                return (*status("Tick at least one AIA or HMI channel to download.", warn=True), *keep, no_update)
+            try:
+                start = picker_datetime(start_vals)
+                end = picker_datetime(end_vals) if "range" in (range_on or []) else None
+            except ValueError as exc:
+                return (*status(str(exc), warn=True), *keep, no_update)
+            now = datetime.now(timezone.utc).replace(tzinfo=None)
+            if start > now or (end is not None and end > now):
+                return (*status("The requested date is in the future.", warn=True), *keep, no_update)
+            if end is None:
+                hit = find_local_frame(store.sources.values(), start, channels)
+                if hit is not None:
+                    return (*status(f"Already downloaded: {hit[0]}, frame {hit[1]}"), *show(hit[0], hit[1], False), "date-row")
+                start_job(run_single, start, channels)
+            else:
+                if end <= start:
+                    return (*status("The end must be after the start.", warn=True), *keep, no_update)
+                name = get_data.format_event_dirname(start, end)
+                expected = max(len(get_data.frame_timestamps(start, end, get_data.channel_cadence(w, DOWNLOAD_CADENCE))) for w in channels)
+                src = store.sources.get(name)
+                if src is not None and src.n_frames >= expected and set(channels) <= set(src.wavelengths):
+                    return (*status(f"Already downloaded: {name} ({src.n_frames} frames)"), *show(name, 0, False), "date-row")
+                start_job(run_range, start, end, channels)
+            return (*status(dl["msg"], poll=True), *keep, "date-row")
+
+        if running:  # poll tick
+            return (*status(dl["msg"], poll=True), *keep, no_update)
+        result, dl["result"] = dl["result"], None
+        selection = show(result["source"], result["frame"], result["updated"]) if result else keep
+        return (*status(dl["msg"], warn=dl["warn"]), *selection, "date-row date-warn" if dl["warn"] else "date-row")
+
     return app
 
 
 def find_sample_jp2_files(samples_dir: str) -> dict[str, str]:
-    """Map every AIA wavelength with a `*.<wavel>.jp2` file in samples_dir to that file."""
+    """Map every channel (AIA wavelength or HMI product) with a `*.<channel>.jp2` file in samples_dir to that file."""
     files = {}
-    for wavel in AIA_WAVELENGTHS:
+    for wavel in CHANNELS:
         matches = sorted(glob.glob(os.path.join(samples_dir, f"*.{wavel}.jp2")))
         if matches:
             files[wavel] = matches[0]
     if len(files) < 3:
-        raise FileNotFoundError(f"Need .jp2 files for at least 3 AIA wavelengths in {samples_dir}, found {list(files)}")
+        raise FileNotFoundError(f"Need .jp2 files for at least 3 channels in {samples_dir}, found {list(files)}")
     return files
 
 
@@ -3050,7 +3457,7 @@ def default_triplet(src: "DataSource") -> tuple:
 
     Samples: 304/171/193, the assignment set_jp2_default() is tuned for (else as for events).
     Event folders: R=304, G=171, B=131 when present; a slot whose preferred channel is missing
-    takes the next available channel (AIA order) not already used; with fewer than 3 channels
+    takes the next available channel (AIA order, then HMI) not already used; with fewer than 3 channels
     the remaining slots stay empty (None)."""
     wavelengths = src.wavelengths
     if not src.is_event and all(w in wavelengths for w in DEFAULT_TRIPLET):
@@ -3064,15 +3471,26 @@ def default_triplet(src: "DataSource") -> tuple:
 
 
 def channel_options(src: "DataSource") -> list[dict]:
-    return [{"label": f"{w} Å", "value": w} for w in src.wavelengths] + [{"label": "— empty —", "value": EMPTY_SLOT}]
+    return [{"label": channel_label(w), "value": w} for w in src.wavelengths] + [{"label": "— empty —", "value": EMPTY_SLOT}]
 
 
 def frame_marks(src: "DataSource") -> dict:
     if src.n_frames < 2:
         return {}
     idx = sorted({0, (src.n_frames - 1) // 2, src.n_frames - 1})
-    return {i: {"label": src.frame_label(i).split(" ")[1][:5] if src.is_event else str(i + 1), "style": {"color": "#d4d4d4", "fontSize": "11px"}} for i in idx}
+    return {i: {"label": src.frame_label(i).split(" ")[1][:5] if src.is_event else str(i), "style": {"color": "#d4d4d4", "fontSize": "11px"}} for i in idx}
 
+
+ADJUST_TAB_STYLE = {
+    "backgroundColor": "#111111",
+    "color": "#a3a3a3",
+    "border": "none",
+    "borderBottom": "1px solid #2a2a2a",
+    "padding": "9px 12px",
+    "fontWeight": "600",
+    "fontSize": "13px",
+}
+ADJUST_TAB_SELECTED_STYLE = {**ADJUST_TAB_STYLE, "color": "#fafafa", "borderBottom": "2px solid #38bdf8"}
 
 ENHANCE_SLIDER_IDS = ["structure", "sharp-amount", "sharp-radius", "sharp-detail", "sharp-masking"]
 GRAY_TRACK = "linear-gradient(to right, #262626, #a3a3a3)"
@@ -3088,6 +3506,83 @@ def make_tone_params(gamma, contrast, structure, amount, radius, detail, masking
         detail=float(detail) if detail is not None else 25.0,
         masking=float(masking) if masking else 0.0,
     )
+
+
+# Get Data (Helioviewer downloads through get_data.py)
+DOWNLOAD_CHANNEL_CHOICES = ("131", "171", "193", "304", "211", "1700")  # Get Data channel checkboxes, in display order
+DEFAULT_DOWNLOAD_CHANNELS = ("131", "171", "193", "304")
+DOWNLOAD_CADENCE = 36  # s, for date ranges
+LOCAL_FRAME_TOLERANCE = timedelta(seconds=DOWNLOAD_CADENCE / 2)  # a local frame this close counts as the requested date
+CLOSEST_WARN_GAP = timedelta(minutes=2)
+DEFAULT_DL_START = datetime(2012, 8, 31, 18, 0)
+DATE_PARTS = [  # (part, label, options)
+    ("year", "YYYY", [{"label": str(y), "value": y} for y in range(2010, datetime.now(timezone.utc).replace(tzinfo=None).year + 1)]),
+    ("month", "MM", [{"label": f"{v:02d}", "value": v} for v in range(1, 13)]),
+    ("day", "DD", [{"label": f"{v:02d}", "value": v} for v in range(1, 32)]),
+    ("hour", "hh", [{"label": f"{v:02d}", "value": v} for v in range(24)]),
+    ("minute", "mm", [{"label": f"{v:02d}", "value": v} for v in range(60)]),
+]
+
+
+def date_row_style(visible: bool = True) -> dict:
+    return {"display": "flex" if visible else "none", "alignItems": "center", "gap": "4px", "marginBottom": "4px"}
+
+
+def date_picker_row(prefix: str, label: str, init: datetime, visible: bool = True) -> html.Div:
+    """YYYY / MM / DD / hh / mm dropdowns; each is searchable, so a value can also be typed (then Enter)."""
+    return html.Div(
+        id=f"{prefix}-row",
+        className="date-row",
+        style=date_row_style(visible),
+        children=[html.Span(label, className="date-row-label", style={"width": "36px", "fontSize": "12px", "color": "#d4d4d4"})]
+        + [
+            dcc.Dropdown(
+                id=f"{prefix}-{part}",
+                options=opts,
+                value=getattr(init, part),
+                placeholder=ph,
+                clearable=False,
+                searchable=True,
+                style={"width": "78px" if part == "year" else "64px", "fontSize": "12px"},
+            )
+            for part, ph, opts in DATE_PARTS
+        ],
+    )
+
+
+def picker_datetime(vals) -> datetime:
+    """(year, month, day, hour, minute) dropdown values -> datetime; ValueError for missing or invalid parts."""
+    if any(v is None for v in vals):
+        raise ValueError("Select all of YYYY, MM, DD, hh and mm.")
+    try:
+        return datetime(*(int(v) for v in vals))
+    except ValueError as exc:
+        raise ValueError(f"Invalid date: {exc}") from None
+
+
+def dl_status_style(warn: bool) -> dict:
+    return {"fontSize": "11px", "color": "#ef4444" if warn else "#38bdf8", "minHeight": "14px", "wordBreak": "break-word", "paddingTop": "4px"}
+
+
+def frame_datetime(frame_time: str) -> "datetime | None":
+    try:
+        return datetime.strptime(frame_time, "%Y-%m-%dT%H%M%S")
+    except ValueError:
+        return None
+
+
+def find_local_frame(sources, dt: datetime, channels, tolerance: timedelta = LOCAL_FRAME_TOLERANCE) -> "tuple[str, int] | None":
+    """(event name, frame index) of the downloaded frame closest to dt, if within tolerance, in an event
+    holding all the given channels."""
+    best = None
+    for src in sources:
+        if not src.is_event or not set(channels) <= set(src.wavelengths):
+            continue
+        for i, t in enumerate(src.frame_times):
+            ft = frame_datetime(t)
+            if ft is not None and abs(ft - dt) <= tolerance and (best is None or abs(ft - dt) < best[0]):
+                best = (abs(ft - dt), src.name, i)
+    return best[1:] if best else None
 
 
 def frame_row_style(src: "DataSource") -> dict:
@@ -3107,9 +3602,11 @@ def frame_step_btn_style() -> dict:
 
 
 def frame_label_text(src: "DataSource", frame: int) -> str:
-    if src.n_frames < 2:
+    if not src.is_event:
         return "Single frame (samples)"
-    return f"Frame {int(frame) + 1} / {src.n_frames}  ·  {src.frame_label(frame)}"
+    if src.n_frames < 2:
+        return f"Single frame  ·  {src.frame_label(0)}"
+    return f"Frame {int(frame)} / {src.n_frames - 1}  ·  {src.frame_label(frame)}"  # 0-based, like the slider box
 
 
 def loaded_files_text(src: "DataSource", frame: int) -> str:
@@ -3120,13 +3617,13 @@ def loaded_files_text(src: "DataSource", frame: int) -> str:
 def waveband_role(slot: int, wavel) -> str:
     if not wavel:
         return f"{RGB_SLOTS[slot]['name']} Input — empty (no channel assigned)"
-    return f"{RGB_SLOTS[slot]['name']} Input — {AIA_ROLES.get(wavel, 'AIA channel')}"
+    return f"{RGB_SLOTS[slot]['name']} Input — {CHANNEL_ROLES.get(wavel, 'AIA channel')}"
 
 
 def channel_caption(slot: int, wavel) -> str:
     if not wavel:
         return f"(empty) → {RGB_SLOTS[slot]['rgb']} input"
-    return f"{wavel} Å → {RGB_SLOTS[slot]['rgb']} input  ·  {aia_cmap_name(wavel)}"
+    return f"{channel_label(wavel)} → {RGB_SLOTS[slot]['rgb']} input  ·  {channel_cmap_name(wavel)}"
 
 
 def main():
@@ -3149,7 +3646,7 @@ def main():
     sources = discover_sources(os.path.abspath(args.samples_dir), args.data_dir)
     for src in sources.values():
         print(f"Data source: {src.label}")
-    app = create_dash_app(FrameStore(sources))
+    app = create_dash_app(FrameStore(sources), os.path.expanduser(args.data_dir))
     print(f"Starting Dash server at http://{args.host}:{args.port}")
     app.run(host=args.host, port=args.port, debug=args.debug)
 
